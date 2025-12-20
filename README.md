@@ -6,12 +6,13 @@
 
 ```
 Ada83/
-├── ada83.c         (159 lines) - lexer→parser→sem→codegen
-├── test.sh         (harness)   - full|sample|group|b-errors
+├── ada83.c         (245 lines) - lexer→parser→sem→codegen+diagnostics
+├── test.sh         (82 lines)  - f|s|g|b (oracle-validated B-test framework)
+├── btest.c         (oracle)    - B-test error coverage validator
 ├── acats/          (4,050)     - a(144)|b(1515)|c(2119)|d(50)|e(54)|l(168)
 ├── rts/            (runtime)   - adart.c|report.ll
 ├── test_results/   (output)    - *.ll|*.bc
-├── acats_logs/     (logs)      - *.err|*.out
+├── acats_logs/     (logs)      - *.err|*.out|*.oracle
 └── reference/      (oracle)    - LRM|GNAT|DIANA
     ├── DIANA.pdf               - Descriptive Intermediate Attributed Notation for Ada
     ├── manual/                 - Ada 83 LRM (lrm-01..lrm-14, appendices a-f)
@@ -26,7 +27,7 @@ Ada83/
         └── ...                 - 2396 more files
 ```
 
-**Quick start**: `gcc -O3 -o ada83 ada83.c && ./test.sh sample`
+**Quick start**: `cc -o ada83 ada83.c -lm && cc -o btest btest.c && ./test.sh s`
 
 **Reference navigation** (implementation oracle):
 ```bash
@@ -85,10 +86,11 @@ pdfgrep -A5 "discriminant" reference/DIANA.pdf
 ```
 
 **Compiler Performance:**
-- **Source size**: 159 lines C99
+- **Source size**: 245 lines C99 (integrated error diagnostics)
 - **Compilation speed**: ~2,100 tests/minute
 - **Memory**: 16MB arena (single allocation)
 - **Time complexity**: O(N) parsing, O(N) semantics, O(N) codegen ✓ ACHIEVED
+- **Error diagnostics**: 4-layer pedagogical wisdom (Ada semantics + layman + fixes + LRM refs)
 
 ---
 
@@ -141,6 +143,7 @@ pdfgrep -A5 "discriminant" reference/DIANA.pdf
 3. **Zero string normalization**: Case-insensitive comparison built into hash function
 4. **Minimal AST**: Only essential nodes, inline metadata
 5. **No backtracking**: LL(2) ensures single-pass parsing
+6. **Integrated diagnostics**: 4-layer error wisdom (Ada semantics, layman, fixes, LRM) with ANSI colors
 
 ---
 
@@ -177,26 +180,33 @@ FAIL = Compiler accepted invalid code (exit code = 0)
 
 **Full suite** (~2-3 minutes, 4,050 tests):
 ```bash
-./test.sh              # or: ./test.sh full
+./test.sh f            # or: ./test.sh full
 ```
 
-**Quick verification** (sample B-tests + C-tests):
+**Quick verification** (6 sample tests):
 ```bash
-./test.sh sample
+./test.sh s            # or: ./test.sh sample
 ```
 
 **Group-specific** (run single test group):
 ```bash
-./test.sh group c      # C-group only (2,119 tests)
-./test.sh group b      # B-group only (negative tests)
-./test.sh group l      # L-group only (generics)
+./test.sh g c          # C-group only (2,119 tests)
+./test.sh g b          # B-group only (negative tests, rejection validation)
+./test.sh g b v        # B-group verbose (show oracle output per test)
+./test.sh g l          # L-group only (generics)
 ```
 
-**B-test error analysis** (debug error detection):
+**B-test oracle validation** (comprehensive error coverage analysis):
 ```bash
-./test.sh b-errors            # Summary of error detection
-./test.sh b-errors verbose    # Show actual errors collected
+./test.sh b            # Oracle validation on all 1,515 B-tests
+./test.sh b v          # Oracle verbose (show coverage scores per test)
 ```
+
+**Oracle validation** verifies:
+- All expected errors are detected (extracted from `-- ERROR:` comments)
+- Error locations match expected line numbers (±1 line tolerance)
+- Coverage score ≥90% = PASS, <90% = FAIL
+- Results saved to `acats_logs/*.oracle`
 
 **Single test** (manual):
 ```bash
@@ -238,10 +248,11 @@ test_results/
 ├── *.bc          # Linked bytecode (test + runtime)
 └── acats_logs/
     ├── *.err     # Compilation errors
-    └── *.out     # Runtime output
+    ├── *.out     # Runtime output
+    └── *.oracle  # B-test error coverage validation results
 ```
 
-**Note**: B-group tests generate only .err files (no .ll - they fail compilation by design).
+**Note**: B-group tests generate `.err` and `.oracle` files (no `.ll` - they fail compilation by design).
 
 ### Understanding Test Names
 
