@@ -6,3 +6,6 @@ ada83
 
 # Test output
 test_results/
+acats_logs/
+*.ll
+*.bc
