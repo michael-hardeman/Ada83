@@ -28,6 +28,28 @@ Ada83/
 
 **Quick start**: `cc -o ada83 ada83.c -lm && ./test.sh s`
 
+## Why This Project Exists
+
+**Goals:**
+1. **Minimal implementation** - Entire Ada 83 compiler in ~160 lines of dense C99
+2. **Educational value** - Study compiler construction through extreme code density
+3. **Oracle-validated testing** - B-test validation measures error detection quality, not just rejection
+4. **Single-pass O(N)** - No AST rewrite, no backtracking, arena allocation
+5. **Reference-driven** - GNAT source + LRM + DIANA specs guide implementation
+
+**Not Goals:**
+- Production compiler (use GNAT)
+- Full Ada 83 conformance
+- Optimized code generation
+- Pretty error messages
+
+**Technical Challenges:**
+- Ada 83 syntax complexity (e.g., `type T(D: Integer) is record...end record;`)
+- Type system: discriminants, variants, derived types, generics
+- Semantic analysis in single pass (forward references, overloading)
+- LLVM IR generation without intermediate lowering
+- Fitting meaningful compiler functionality into 160 LOC
+
 **Reference navigation** (implementation oracle):
 ```bash
 # LRM chapter lookup
@@ -54,35 +76,50 @@ pdfgrep -A5 "discriminant" reference/DIANA.pdf
 
 ---
 
-## Current Scorecard
+## Current Status
 
 > **Updated:** 2025-12-20
+> **Development Stage:** Early implementation - core features functional, extensive work remains
 
-### ACATS Conformance: 3,403 / 4,050 tests (84.0%)
+### Test Results (Sample: 4 ACATS tests)
 
-**Positive Tests** (should compile, link, execute):
+**Negative Tests** (B-group: invalid code detection with error coverage):
 ```
-┌──────────┬─────────┬───────┬──────────┐
-│  Group   │ Passing │ Total │   Rate   │
-├──────────┼─────────┼───────┼──────────┤
-│ c-group  │  1,659  │ 2,119 │  78.3%   │ Core language features
-│ a-group  │    119  │   144 │  82.6%   │ Fundamentals
-│ l-group  │    159  │   168 │  94.6%   │ Generics, elaboration
-│ d-group  │     50  │    50 │ 100.0%   │ Representation clauses
-│ e-group  │     52  │    54 │  96.3%   │ Distributed systems
-├──────────┼─────────┼───────┼──────────┤
-│ Subtotal │  2,039  │ 2,535 │  80.4%   │
-└──────────┴─────────┴───────┴──────────┘
+Test        Expected  Found  Coverage  Result
+b22003a     3 errors  1      33%       ✗ LOW_COVERAGE
+b22001h     1 error   1      100%      ✓ PASS
+```
+**B-test Oracle Validation:** Tests must detect ≥90% of expected errors (±1 line).
+Current pass rate on sample: **50%** (1/2 tests with adequate error coverage)
+
+**Positive Tests** (C-group: should compile/link/execute):
+```
+Test        Status        Reason
+c95009a     ○ SKIP        Link failure (unresolved symbols)
+c45231a     ○ SKIP        Parse error (line 74)
 ```
 
-**Negative Tests** (should be rejected - compiler error detection):
-```
-┌──────────┬─────────┬───────┬──────────┐
-│  Group   │ Passing │ Total │   Rate   │
-├──────────┼─────────┼───────┼──────────┤
-│ b-group  │  1,364  │ 1,515 │  90.0%   │ Invalid code detection
-└──────────┴─────────┴───────┴──────────┘
-```
+### Implementation Coverage (Estimated)
+
+**Core Language Features:**
+- ✓ Basic types: Integer, Boolean, Character, enumerations
+- ✓ Arithmetic/logical operators, control flow (if/case/loop)
+- ✓ Procedures, functions with parameters
+- ✓ Records, arrays (1D, limited multidimensional)
+- ✓ Packages (basic), subprograms
+- ⚠ Tasks (partial - entry/accept stubs, no actual concurrency)
+- ⚠ Generics (partial - instantiation framework, limited functionality)
+- ⚠ Exceptions (basic raise/handle, no full propagation)
+- ✗ Access types (pointers) - minimal support
+- ✗ Representation clauses - not implemented
+- ✗ Most Ada 83 standard library
+
+**Current Capabilities:**
+- Single-file compilation to LLVM IR
+- ~55% B-test rejection rate (detects some illegal programs)
+- Low error coverage (~33% average - finds 1 of 3 expected errors)
+- Basic semantic analysis (type checking, name resolution)
+- Simple error messages (file:line:col format)
 
 **Compiler Performance:**
 - **Source size**: 160 lines C99
@@ -172,8 +209,32 @@ SKIP = Compilation or linking error (unimplemented feature)
 PASS = Compiler rejected code AND detected ≥90% of expected errors (±1 line tolerance)
 FAIL = Compiler accepted invalid code OR error coverage <90%
 ```
-Each B-test contains `-- ERROR:` comments marking expected compiler errors.
-Oracle validation extracts these expected errors and verifies the compiler detected them.
+
+**Oracle Validation Methodology:**
+
+B-tests contain `-- ERROR:` comments marking expected compiler errors:
+```ada
+IF BOR FALSE THEN       -- ERROR: BOR (undeclared identifier)
+```
+
+The test.sh oracle (`^()` function):
+1. Extracts expected error line numbers from `-- ERROR` comments
+2. Runs compiler and parses `file:line:col` error output
+3. Matches actual vs expected errors (±1 line tolerance)
+4. Calculates coverage: `matched_errors / expected_errors`
+5. PASS only if coverage ≥ 90%
+
+**Why This Matters:** Simple rejection (exit code ≠ 0) is insufficient. A compiler could
+reject all B-tests by reporting "syntax error" on line 1, achieving 100% rejection but
+0% error coverage. Oracle validation ensures the compiler finds the *specific* errors
+the test targets, measuring error detection quality, not just rejection rate.
+
+**Example:**
+```
+acats/b22003a.ada expects errors on lines: 19, 23, 27
+Compiler found errors on: 19
+Coverage: 1/3 = 33% → FAIL (LOW_COVERAGE)
+```
 
 ### Running Tests
 

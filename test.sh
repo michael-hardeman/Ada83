@@ -5,12 +5,12 @@ z=$'\e[0m' d=$'\e[2m' k=$'\e[90m' w=$'\e[97m' g=$'\e[32m' r=$'\e[31m' y=$'\e[33m
 .(){ printf %.3f "$(bc<<<"scale=4;($(date +%s%3N)-${X[t]})/1000")";}
 E(){ printf "  ${b}%-18s${z} ${1}${2}${z} ${w}%-14s${z}" "$3" "$4";[[ -n ${5:-} ]]&&printf " ${k}%s${z}" "$5";printf "\n";}
 ^(){ local f=$1;local -a x a;local i=0 h=0;while IFS= read -r l;do((++i));[[ $l =~ --\ ERROR ]]&&x+=($i);done<"$f"
-while read -r n;do a+=($n);done< <(./ada83 "$f" 2>&1|sed 's/\x1b\[[0-9;]*m//g'|grep -oP 'ERROR at [^:]+:\K[0-9]+')
+while IFS=: read -r _ n _;do a+=($n);done< <(./ada83 "$f" 2>&1|grep "^[^:]*:[0-9]")
 for e in ${x[@]+"${x[@]}"};do for v in ${a[@]+"${a[@]}"};do((v>=e-1&&v<=e+1))&&{ ((++h));break;};done;done
 X[ec]=$((X[ec]+h)) X[ee]=$((X[ee]+${#x[@]}));printf %d:%d $h ${#x[@]};}
 @(){ local f=$1 n=$(basename "$f" .ada);local -a x t a;local i=0 h=0
 while IFS= read -r l;do((++i));[[ $l =~ --\ ERROR:?\ *(.*) ]]&&{ x+=($i);t+=("${BASH_REMATCH[1]:-?}");};done<"$f"
-while read -r m;do a+=($m);done< <(./ada83 "$f" 2>&1|sed 's/\x1b\[[0-9;]*m//g'|grep -oP 'ERROR at [^:]+:\K[0-9]+');printf "\n   ${m}${'':->68}${z}\n"
+while IFS=: read -r _ m _;do a+=($m);done< <(./ada83 "$f" 2>&1|grep "^[^:]*:[0-9]");printf "\n   ${m}${'':->68}${z}\n"
 printf "   ${w}%s${z}  ${d}expect${z} ${w}%d${z}  ${d}reported${z} ${w}%d${z}  ${d}tolerance${z} ±1\n" "$n" ${#x[@]} ${#a[@]}
 printf "   ${m}${'':->68}${z}\n";for j in ${!x[@]};do local e=${x[$j]} s=${t[$j]} q=0
 for v in ${a[@]+"${a[@]}"};do((v>=e-1&&v<=e+1))&&{ q=1;break;};done
