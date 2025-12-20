@@ -131,49 +131,6 @@ The compiler is being developed iteratively with focus on architectural correctn
 **Next milestone:** Address named parameter calls, then aggregate code generation.
 
 
-## Architecture: Single-Pass O(N) Pipeline
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ INPUT: Ada 83 Source Code                                   │
-└─────────────────────┬───────────────────────────────────────┘
-                      ▼
-    ╔═════════════════════════════════════════════════════╗
-    ║  LEXER (O(N))                                       ║
-    ║  • Incremental token scanning                       ║
-    ║  • No string copies (pointer + length)              ║
-    ║  • Case-insensitive hash built-in                   ║
-    ╚═════════════════════════════════════════════════════╝
-                      ▼
-    ╔═════════════════════════════════════════════════════╗
-    ║  PARSER (O(N))                                      ║
-    ║  • Recursive descent, zero backtracking             ║
-    ║  • LL(2) grammar: lookahead via pa()                ║
-    ║  • Operator precedence climbing                     ║
-    ║  • Parse combinators: pm(), pe(), pa()              ║
-    ╚═════════════════════════════════════════════════════╝
-                      ▼
-    ╔═════════════════════════════════════════════════════╗
-    ║  SEMANTICS (O(N))                                   ║
-    ║  • Single-pass name resolution                      ║
-    ║  • FNV-1a hash (65,521 buckets)                     ║
-    ║  • Structural type equivalence                      ║
-    ║  • Bottom-up constant folding                       ║
-    ╚═════════════════════════════════════════════════════╝
-                      ▼
-    ╔═════════════════════════════════════════════════════╗
-    ║  CODEGEN (O(N))                                     ║
-    ║  • Direct LLVM IR emission (no AST rewrite)         ║
-    ║  • SSA form with phi insertion                      ║
-    ║  • LLVM handles register allocation                 ║
-    ║  • Nested scope via alloca hoisting                 ║
-    ╚═════════════════════════════════════════════════════╝
-                      ▼
-┌─────────────────────────────────────────────────────────────┐
-│ OUTPUT: LLVM IR (.ll) → llc → native code                   │
-└─────────────────────────────────────────────────────────────┘
-```
-
 **Design Principles:**
 1. **Arena allocation**: Single 16MB bump allocator, O(1) per allocation, no free() calls
 2. **Hash-based symbols**: FNV-1a with linear probing, 0.7 load factor
