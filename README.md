@@ -14,20 +14,32 @@ Build the world's most efficient single-pass Ada 83 compiler by combining:
 > Updated: 2025-12-20
 
 ### ACATS Test Suite Conformance
+
+**Positive Tests** (should compile and run):
 ```
 +----------+---------+-------+----------+
 |  Group   | Passing | Total |   Rate   |
 +----------+---------+-------+----------+
 | c-group  |  1,659  | 2,119 |  78.3%   |
-| b-group  |    850  | 1,515 |  56.1%   |
 | a-group  |    119  |   144 |  82.6%   |
-| d-group  |     50  |    72 |  69.4%   |
-| e-group  |     52  |    98 |  53.1%   |
-| l-group  |    159  |   199 |  79.9%   |
+| l-group  |    159  |   168 |  94.6%   |
+| d-group  |     50  |    50 | 100.0%   |
+| e-group  |     52  |    54 |  96.3%   |
 +----------+---------+-------+----------+
-|  TOTAL   |  2,890  | 4,050 |  71.4%   |
+| Subtotal |  2,039  | 2,535 |  80.4%   |
 +----------+---------+-------+----------+
 ```
+
+**Negative Tests** (should be rejected by compiler):
+```
++----------+---------+-------+----------+
+|  Group   | Passing | Total |   Rate   |
++----------+---------+-------+----------+
+| b-group  |  1,364  | 1,515 |  90.0%   |
++----------+---------+-------+----------+
+```
+
+**Combined Total**: 3,403 / 4,050 tests (84.0%)
 
 ### Compiler Metrics
 ```
