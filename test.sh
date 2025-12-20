@@ -4,13 +4,13 @@ z=$'\e[0m' d=$'\e[2m' k=$'\e[90m' w=$'\e[97m' g=$'\e[32m' r=$'\e[31m' y=$'\e[33m
 :()(((${2:-1}>0))&&printf %d $((100*$1/$2))||printf 0)
 .(){ printf %.3f "$(bc<<<"scale=4;($(date +%s%3N)-${X[t]})/1000")";}
 E(){ printf "  ${b}%-18s${z} ${1}${2}${z} ${w}%-14s${z}" "$3" "$4";[[ -n ${5:-} ]]&&printf " ${k}%s${z}" "$5";printf "\n";}
-^(){ local f=$1 -a x a i=0 h=0;while IFS= read -r l;do((++i));[[ $l =~ --\ ERROR ]]&&x+=($i);done<"$f"
-while IFS=: read -r _ n;do a+=($n);done< <(./ada83 "$f" 2>&1)
+^(){ local f=$1;local -a x a;local i=0 h=0;while IFS= read -r l;do((++i));[[ $l =~ --\ ERROR ]]&&x+=($i);done<"$f"
+while read -r n;do a+=($n);done< <(./ada83 "$f" 2>&1|sed 's/\x1b\[[0-9;]*m//g'|grep -oP 'ERROR at [^:]+:\K[0-9]+')
 for e in ${x[@]+"${x[@]}"};do for v in ${a[@]+"${a[@]}"};do((v>=e-1&&v<=e+1))&&{ ((++h));break;};done;done
 X[ec]=$((X[ec]+h)) X[ee]=$((X[ee]+${#x[@]}));printf %d:%d $h ${#x[@]};}
-@(){ local f=$1 n=$(basename "$f" .ada) -a x t a i=0 h=0
+@(){ local f=$1 n=$(basename "$f" .ada);local -a x t a;local i=0 h=0
 while IFS= read -r l;do((++i));[[ $l =~ --\ ERROR:?\ *(.*) ]]&&{ x+=($i);t+=("${BASH_REMATCH[1]:-?}");};done<"$f"
-while IFS=: read -r _ n;do a+=($n);done< <(./ada83 "$f" 2>&1);printf "\n   ${m}${'':->68}${z}\n"
+while read -r m;do a+=($m);done< <(./ada83 "$f" 2>&1|sed 's/\x1b\[[0-9;]*m//g'|grep -oP 'ERROR at [^:]+:\K[0-9]+');printf "\n   ${m}${'':->68}${z}\n"
 printf "   ${w}%s${z}  ${d}expect${z} ${w}%d${z}  ${d}reported${z} ${w}%d${z}  ${d}tolerance${z} ±1\n" "$n" ${#x[@]} ${#a[@]}
 printf "   ${m}${'':->68}${z}\n";for j in ${!x[@]};do local e=${x[$j]} s=${t[$j]} q=0
 for v in ${a[@]+"${a[@]}"};do((v>=e-1&&v<=e+1))&&{ q=1;break;};done
@@ -24,7 +24,7 @@ if ! timeout 3 llvm-link -o test_results/$n.bc test_results/$n.ll rts/report.ll 
 E "$y" ○ "$n" BIND "unresolved symbols";((++X[s]));return;fi
 timeout 5 lli test_results/$n.bc>acats_logs/$n.out 2>&1&&E "$g" ✓ "$n" PASSED&&((++X[a]))||E "$r" ✗ "$n" FAILED "exit $?"&&((++X[f]));;
 [bB])if timeout 3 ./ada83 "$f" 2>acats_logs/$n.err;then E "$r" ✗ "$n" WRONG_ACCEPT "compiled when should reject";((++X[f]))
-else ((++X[b]));[[ $v == v ]]&&@ "$f"||E "$g" ✓ "$n" REJECTED "$(wc -l<acats_logs/$n.err 2>/dev/null||echo 0) errors reported";fi;;
+else q=$(^ "$f");h=${q%:*};x=${q#*:};p=$(: $h $x);((p>=90))&&{ ((++X[b]));[[ $v == v ]]&&@ "$f"||E "$g" ✓ "$n" REJECTED "$h/$x errors (${p}%)";}||{ ((++X[f]));E "$r" ✗ "$n" LOW_COVERAGE "$h/$x errors (${p}%)";};fi;;
 [cC])if ! timeout 3 ./ada83 "$f">test_results/$n.ll 2>acats_logs/$n.err;then
 E "$y" ○ "$n" COMPILE "$(head -1 acats_logs/$n.err 2>/dev/null|cut -c1-50)";((++X[s]));return;fi
 if ! timeout 3 llvm-link -o test_results/$n.bc test_results/$n.ll rts/report.ll 2>acats_logs/$n.link;then

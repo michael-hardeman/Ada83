@@ -176,11 +176,13 @@ FAIL = Runtime error or incorrect output
 SKIP = Compilation or linking error (unimplemented feature)
 ```
 
-**Negative Tests** (B):
+**Negative Tests** (B - Oracle-validated error coverage):
 ```
-PASS = Compiler rejected code (exit code ≠ 0)
-FAIL = Compiler accepted invalid code (exit code = 0)
+PASS = Compiler rejected code AND detected ≥90% of expected errors (±1 line tolerance)
+FAIL = Compiler accepted invalid code OR error coverage <90%
 ```
+Each B-test contains `-- ERROR:` comments marking expected compiler errors.
+Oracle validation extracts these expected errors and verifies the compiler detected them.
 
 ### Running Tests
 
