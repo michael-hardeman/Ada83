@@ -6,7 +6,7 @@
 
 ```
 Ada83/
-├── ada83.c         (245 lines) - lexer→parser→sem→codegen+diagnostics
+├── ada83.c         (160 lines) - lexer→parser→sem→codegen
 ├── test.sh         (93 lines)  - f|s|g|b (oracle-validated B-test framework)
 ├── acats/          (4,050)     - a(144)|b(1515)|c(2119)|d(50)|e(54)|l(168)
 ├── rts/            (runtime)   - adart.c|report.ll
@@ -85,11 +85,10 @@ pdfgrep -A5 "discriminant" reference/DIANA.pdf
 ```
 
 **Compiler Performance:**
-- **Source size**: 245 lines C99 (integrated error diagnostics)
+- **Source size**: 160 lines C99
 - **Compilation speed**: ~2,100 tests/minute
 - **Memory**: 16MB arena (single allocation)
 - **Time complexity**: O(N) parsing, O(N) semantics, O(N) codegen ✓ ACHIEVED
-- **Error diagnostics**: 4-layer pedagogical wisdom (Ada semantics + layman + fixes + LRM refs)
 
 ---
 
@@ -142,7 +141,6 @@ pdfgrep -A5 "discriminant" reference/DIANA.pdf
 3. **Zero string normalization**: Case-insensitive comparison built into hash function
 4. **Minimal AST**: Only essential nodes, inline metadata
 5. **No backtracking**: LL(2) ensures single-pass parsing
-6. **Integrated diagnostics**: 4-layer error wisdom (Ada semantics, layman, fixes, LRM) with ANSI colors
 
 ---
 
