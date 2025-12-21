@@ -11,3 +11,6 @@ test_summary.txt
 *.ll
 *.bc
 T*.ll
+
+# Generated ALI files (Ada Library Information)
+*.ali
