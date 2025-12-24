@@ -1,6 +1,7 @@
 # Compiled binary
 ada83
 a83
+ada83_debug
 
 # Backup files
 *.backup
@@ -12,6 +13,8 @@ acats_logs/
 test_summary.txt
 test_output.txt
 *.ll
+!rts/rt.ll
+!rts/rt_wrappers.ll
 *.bc
 T*.ll
 
