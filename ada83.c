@@ -1680,6 +1680,7 @@ struct Generic_Template
   Node_Vector declarations;
   Syntax_Node *unit;
   Syntax_Node *body;
+  uint32_t scope;  // Scope where the generic was declared
 };
 static Syntax_Node *node_new(Node_Kind k, Source_Location l)
 {
@@ -3327,11 +3328,47 @@ static Syntax_Node *parse_statement_or_label(Parser *parser)
     slv(&parser->label_stack, label);
   }
   if (parser_at(parser, T_IF))
-    return parse_if(parser);
+  {
+    Syntax_Node *stmt = parse_if(parser);
+    if (label.string)
+    {
+      Syntax_Node *block = ND(BL, location);
+      block->block.label = label;
+      Node_Vector statements = {0};
+      nv(&statements, stmt);
+      block->block.statements = statements;
+      return block;
+    }
+    return stmt;
+  }
   if (parser_at(parser, T_CSE))
-    return parse_case(parser);
+  {
+    Syntax_Node *stmt = parse_case(parser);
+    if (label.string)
+    {
+      Syntax_Node *block = ND(BL, location);
+      block->block.label = label;
+      Node_Vector statements = {0};
+      nv(&statements, stmt);
+      block->block.statements = statements;
+      return block;
+    }
+    return stmt;
+  }
   if (parser_at(parser, T_SEL))
-    return parse_statement_list(parser);
+  {
+    Syntax_Node *stmt = parse_statement_list(parser);
+    if (label.string)
+    {
+      Syntax_Node *block = ND(BL, location);
+      block->block.label = label;
+      Node_Vector statements = {0};
+      nv(&statements, stmt);
+      block->block.statements = statements;
+      return block;
+    }
+    return stmt;
+  }
   if (parser_at(parser, T_LOOP) or parser_at(parser, T_WHI) or parser_at(parser, T_FOR))
     return parse_loop(parser, label);
   if (parser_at(parser, T_DEC) or parser_at(parser, T_BEG))
@@ -4973,11 +5010,29 @@ static Symbol *symbol_add_overload(Symbol_Manager *symbol_manager, Symbol *s)
     symbol_manager->sst[symbol_manager->ssd++] = s;
   return s;
 }
+// Recompute uid after parent has been set (parent is set after symbol_new returns)
+static void symbol_update_uid(Symbol *s)
+{
+  if (not s)
+    return;
+  uint64_t u = string_hash(s->name);
+  if (s->parent)
+  {
+    u = u * 31 + string_hash(s->parent->name);
+    if (s->level > 0)
+    {
+      u = u * 31 + s->scope;
+      u = u * 31 + s->elaboration_level;
+    }
+  }
+  s->uid = (uint32_t) (u & 0xFFFFFFFF);
+}
 static Symbol *symbol_find(Symbol_Manager *symbol_manager, String_Slice nm)
 {
   Symbol *imm = 0, *pot = 0;
   uint32_t h = symbol_hash(nm);
   for (Symbol *s = symbol_manager->sy[h]; s; s = s->next)
+  {
     if (string_equal_ignore_case(s->name, nm))
     {
       if (s->visibility & 1 and (not imm or s->scope > imm->scope))
@@ -4985,6 +5040,7 @@ static Symbol *symbol_find(Symbol_Manager *symbol_manager, String_Slice nm)
       if (s->visibility & 2 and not pot)
         pot = s;
     }
+  }
   if (imm)
     return imm;
   if (pot)
@@ -5128,13 +5184,22 @@ static void symbol_find_use(Symbol_Manager *symbol_manager, Symbol *s, String_Sl
 }
 static Generic_Template *generic_find(Symbol_Manager *symbol_manager, String_Slice nm)
 {
+  Generic_Template *best = 0;
+  uint32_t best_scope = 0;
   for (uint32_t i = 0; i < symbol_manager->gt.count; i++)
   {
     Generic_Template *g = symbol_manager->gt.data[i];
-    if (string_equal_ignore_case(g->name, nm))
-      return g;
+    // Match by name and prefer generics in the current scope or nearest enclosing scope
+    if (string_equal_ignore_case(g->name, nm) and g->scope <= symbol_manager->sc)
+    {
+      if (not best or g->scope > best_scope)
+      {
+        best = g;
+        best_scope = g->scope;
+      }
+    }
   }
-  return 0;
+  return best;
 }
 static int type_scope(Type_Info *, Type_Info *, Type_Info *);
 static Symbol *symbol_find_with_arity(Symbol_Manager *symbol_manager, String_Slice nm, int na, Type_Info *tx)
@@ -5158,7 +5223,33 @@ static Symbol *symbol_find_with_arity(Symbol_Manager *symbol_manager, String_Sli
   if (not cv.count)
     return 0;
   if (cv.count == 1)
-    return cv.data[0];
+  {
+    // Check arity even for single candidate when na >= 0
+    Symbol *c = cv.data[0];
+    if (na < 0)
+      return c;
+    // For functions/procedures, check if any overload matches the arity
+    if ((c->k == 4 or c->k == 5) and c->overloads.count > 0)
+    {
+      for (uint32_t j = 0; j < c->overloads.count; j++)
+      {
+        Syntax_Node *b = c->overloads.data[j];
+        if (b->k == N_PB or b->k == N_FB or b->k == N_PD or b->k == N_FD)
+        {
+          int np = b->body.subprogram_spec->subprogram.parameters.count;
+          if (np == na)
+            return c;
+        }
+      }
+      // No overload matched the arity
+      return 0;
+    }
+    // For type conversions (k==1), only match if na==1
+    if (c->k == 1)
+      return na == 1 ? c : 0;
+    // For other symbols, return as-is
+    return c;
+  }
   Symbol *br = 0;
   int bs = -1;
   for (uint32_t i = 0; i < cv.count; i++)
@@ -5794,6 +5885,16 @@ static bool type_covers(Type_Info *a, Type_Info *b)
   if (is_discrete(a) and is_discrete(b))
     return 1;
   if (is_real_type(a) and is_real_type(b))
+    return 1;
+  // Allow string comparisons - handle TY_STR directly and arrays of characters
+  Type_Info *ac = type_canonical_concrete(a);
+  Type_Info *bc = type_canonical_concrete(b);
+  // Check if both are string types (TY_STR or array of CHARACTER)
+  bool a_is_string = (a == TY_STR) || (ac && ac->k == TYPE_ARRAY && ac->element_type &&
+      (ac->element_type->k == TYPE_CHARACTER || ac->element_type == TY_CHAR));
+  bool b_is_string = (b == TY_STR) || (bc && bc->k == TYPE_ARRAY && bc->element_type &&
+      (bc->element_type->k == TYPE_CHARACTER || bc->element_type == TY_CHAR));
+  if (a_is_string && b_is_string)
     return 1;
   return 0;
 }
@@ -6466,7 +6567,19 @@ static bool types_compatible_for_operator(Token_Kind op, Type_Info *left, Type_I
 
     // Equality: compatible types (LRM 4.5.2)
     case T_EQ: case T_NE:
+    {
+      // Same types are compatible
+      if (lc == rc) return 1;
+      // Check for string types - any array of CHARACTER is compatible with STRING
+      bool l_is_string = (lc->k == TYPE_ARRAY && lc->element_type &&
+          (lc->element_type->k == TYPE_CHARACTER || lc->element_type == TY_CHAR));
+      bool r_is_string = (rc->k == TYPE_ARRAY && rc->element_type &&
+          (rc->element_type->k == TYPE_CHARACTER || rc->element_type == TY_CHAR));
+      if (l_is_string && r_is_string)
+        return 1;
+      // Fall back to general type coverage
       return type_covers(lc, rc) || type_covers(rc, lc);
+    }
 
     // Relational: scalar types (LRM 4.5.2)
     case T_LT: case T_LE: case T_GT: case T_GE:
@@ -8338,12 +8451,15 @@ static Syntax_Node *generate_clone(Symbol_Manager *symbol_manager, Syntax_Node *
                                                          : N)
                                 : N;
     Generic_Template *g = generic_find(symbol_manager, nm);
-    if (not g)
+    // Only reuse an existing template if it's in the current scope
+    // Each DECLARE block gets its own generic template
+    if (not g or g->scope != symbol_manager->sc)
     {
       g = generic_type_new(nm);
       g->formal_parameters = n->generic_decl.formal_parameters;
       g->declarations = n->generic_decl.declarations;
       g->unit = n->generic_decl.unit;
+      g->scope = symbol_manager->sc;  // Record the scope where this generic is declared
       gv(&symbol_manager->gt, g);
       if (g->name.string and g->name.length)
       {
@@ -8361,7 +8477,10 @@ static Syntax_Node *generate_clone(Symbol_Manager *symbol_manager, Syntax_Node *
     if (g)
     {
       resolve_array_parameter(symbol_manager, &g->formal_parameters, &n->generic_inst.actual_parameters);
-      Syntax_Node *inst = node_clone_substitute(g->unit, &g->formal_parameters, &n->generic_inst.actual_parameters);
+      // For package generics, clone the spec first (body handled separately in N_GINST resolve)
+      // For procedure/function generics, prefer cloning the body over the spec
+      Syntax_Node *to_clone = (g->unit && g->unit->k == N_PKS) ? g->unit : (g->body ? g->body : g->unit);
+      Syntax_Node *inst = node_clone_substitute(to_clone, &g->formal_parameters, &n->generic_inst.actual_parameters);
       if (inst)
       {
         if (inst->k == N_PB or inst->k == N_FB or inst->k == N_PD or inst->k == N_FD)
@@ -8403,7 +8522,15 @@ static void resolve_declaration(Symbol_Manager *symbol_manager, Syntax_Node *n)
     if (inst)
     {
       resolve_declaration(symbol_manager, inst);
-      if (inst->k == N_PKS)
+      // Link the instantiation node to the instantiated symbol
+      if (inst->symbol)
+        n->symbol = inst->symbol;
+      if (inst->k == N_PB or inst->k == N_FB)
+      {
+        // Generic procedure/function instantiation - add body to instantiated bodies list
+        nv(&symbol_manager->ib, inst);
+      }
+      else if (inst->k == N_PKS)
       {
         Generic_Template *g = generic_find(symbol_manager, n->generic_inst.generic_name);
         if (g and g->body)
@@ -8804,14 +8931,33 @@ static void resolve_declaration(Symbol_Manager *symbol_manager, Syntax_Node *n)
   {
     Syntax_Node *sp = n->body.subprogram_spec;
     Type_Info *ft = type_new(TYPE_STRING, sp->subprogram.name);
-    Symbol *s = symbol_add_overload(symbol_manager, symbol_new(sp->subprogram.name, 4, ft, n));
+    Symbol *s = 0;
+    // For SEPARATE bodies, try to find existing symbol from body stub
+    if (n->k == N_PB and SEPARATE_PACKAGE.string)
+    {
+      Symbol *parent_sym = symbol_find(symbol_manager, SEPARATE_PACKAGE);
+      if (parent_sym)
+      {
+        // Look for existing procedure symbol in parent's scope
+        for (int h = 0; h < 4096 and not s; h++)
+          for (Symbol *es = symbol_manager->sy[h]; es and not s; es = es->next)
+            if (es->k == 4 and es->parent == parent_sym
+                and string_equal_ignore_case(es->name, sp->subprogram.name))
+              s = es;
+      }
+    }
+    if (not s)
+      s = symbol_add_overload(symbol_manager, symbol_new(sp->subprogram.name, 4, ft, n));
     nv(&s->overloads, n);
     n->symbol = s;
     n->body.elaboration_level = s->elaboration_level;
     // Set parent to enclosing procedure if nested, otherwise to package
-    s->parent = symbol_manager->pn > 0 ? symbol_manager->ps[symbol_manager->pn - 1]
-                : (symbol_manager->pk ? get_pkg_sym(symbol_manager, symbol_manager->pk)
-                : (SEPARATE_PACKAGE.string ? symbol_find(symbol_manager, SEPARATE_PACKAGE) : 0));
+    if (not s->parent)
+      s->parent = symbol_manager->pn > 0 ? symbol_manager->ps[symbol_manager->pn - 1]
+                  : (symbol_manager->pk ? get_pkg_sym(symbol_manager, symbol_manager->pk)
+                  : (SEPARATE_PACKAGE.string ? symbol_find(symbol_manager, SEPARATE_PACKAGE) : 0));
+    // Recompute uid now that parent is set (uid includes parent name hash)
+    symbol_update_uid(s);
     nv(&ft->operations, n);
     if (n->k == N_PB)
     {
@@ -8822,9 +8968,20 @@ static void resolve_declaration(Symbol_Manager *symbol_manager, Syntax_Node *n)
       symbol_compare_parameter(symbol_manager);
       n->body.parent = s;
       Generic_Template *gt = generic_find(symbol_manager, sp->subprogram.name);
-      if (gt)
+      // Only set gt->body if this is truly the generic's body, not just a procedure with the same name
+      // The body should be at scope very close to where the generic was declared (within +2 for nested scopes)
+      // This prevents unrelated procedures P from overwriting a generic P's body from an outer scope
+      if (gt and gt->scope + 2 >= symbol_manager->sc)
+      {
+        gt->body = n;  // Store the body in the generic template
         for (uint32_t i = 0; i < gt->formal_parameters.count; i++)
           resolve_declaration(symbol_manager, gt->formal_parameters.data[i]);
+        // Don't resolve generic body here - it will be resolved when instantiated
+        if (symbol_manager->pn > 0)
+          symbol_manager->pn--;
+        symbol_manager->lv--;
+        break;
+      }
       for (uint32_t i = 0; i < sp->subprogram.parameters.count; i++)
       {
         Syntax_Node *p = sp->subprogram.parameters.data[i];
@@ -8855,14 +9012,31 @@ static void resolve_declaration(Symbol_Manager *symbol_manager, Syntax_Node *n)
     Type_Info *rt = resolve_subtype(symbol_manager, sp->subprogram.return_type);
     Type_Info *ft = type_new(TYPE_STRING, sp->subprogram.name);
     ft->element_type = rt;
-    Symbol *s = symbol_add_overload(symbol_manager, symbol_new(sp->subprogram.name, 5, ft, n));
+    Symbol *s = 0;
+    // For SEPARATE bodies, try to find existing symbol from body stub
+    if (SEPARATE_PACKAGE.string)
+    {
+      Symbol *parent_sym = symbol_find(symbol_manager, SEPARATE_PACKAGE);
+      if (parent_sym)
+      {
+        // Look for existing function symbol in parent's scope
+        for (int h = 0; h < 4096 and not s; h++)
+          for (Symbol *es = symbol_manager->sy[h]; es and not s; es = es->next)
+            if (es->k == 5 and es->parent == parent_sym
+                and string_equal_ignore_case(es->name, sp->subprogram.name))
+              s = es;
+      }
+    }
+    if (not s)
+      s = symbol_add_overload(symbol_manager, symbol_new(sp->subprogram.name, 5, ft, n));
     nv(&s->overloads, n);
     n->symbol = s;
     n->body.elaboration_level = s->elaboration_level;
     // Set parent to enclosing procedure if nested, otherwise to package
-    s->parent = symbol_manager->pn > 0 ? symbol_manager->ps[symbol_manager->pn - 1]
-                : (symbol_manager->pk ? get_pkg_sym(symbol_manager, symbol_manager->pk)
-                : (SEPARATE_PACKAGE.string ? symbol_find(symbol_manager, SEPARATE_PACKAGE) : 0));
+    if (not s->parent)
+      s->parent = symbol_manager->pn > 0 ? symbol_manager->ps[symbol_manager->pn - 1]
+                  : (symbol_manager->pk ? get_pkg_sym(symbol_manager, symbol_manager->pk)
+                  : (SEPARATE_PACKAGE.string ? symbol_find(symbol_manager, SEPARATE_PACKAGE) : 0));
     nv(&ft->operations, n);
     if (n->k == N_FB)
     {
@@ -8873,9 +9047,18 @@ static void resolve_declaration(Symbol_Manager *symbol_manager, Syntax_Node *n)
       symbol_compare_parameter(symbol_manager);
       n->body.parent = s;
       Generic_Template *gt = generic_find(symbol_manager, sp->subprogram.name);
-      if (gt)
+      // Only set gt->body if this is truly the generic's body, not just a function with the same name
+      if (gt and gt->scope + 2 >= symbol_manager->sc)
+      {
+        gt->body = n;  // Store the body in the generic template
         for (uint32_t i = 0; i < gt->formal_parameters.count; i++)
           resolve_declaration(symbol_manager, gt->formal_parameters.data[i]);
+        // Don't resolve generic body here - it will be resolved when instantiated
+        if (symbol_manager->pn > 0)
+          symbol_manager->pn--;
+        symbol_manager->lv--;
+        break;
+      }
       for (uint32_t i = 0; i < sp->subprogram.parameters.count; i++)
       {
         Syntax_Node *p = sp->subprogram.parameters.data[i];
@@ -9358,7 +9541,8 @@ static Syntax_Node *pks2(Symbol_Manager *symbol_manager, String_Slice nm, const 
 static void parse_package_specification(Symbol_Manager *symbol_manager, String_Slice nm, const char *src)
 {
   Symbol *ps = symbol_find(symbol_manager, nm);
-  if (ps and ps->k == 6)
+  // Only skip if we have a real package with a definition (not just a built-in placeholder)
+  if (ps and ps->k == 6 and ps->definition)
     return;
   pks2(symbol_manager, nm, src);
 }
@@ -9397,6 +9581,41 @@ static void symbol_manager_use_clauses(Symbol_Manager *symbol_manager, Syntax_No
                 d->object_decl.identifiers.data[k]->symbol->visibility |= 2;
                 sv(&symbol_manager->uv, d->object_decl.identifiers.data[k]->symbol);
               }
+          }
+          else if (d->k == N_PD)
+          {
+            // Procedure declaration - use d->symbol directly
+            if (d->symbol) { d->symbol->visibility |= 2; sv(&symbol_manager->uv, d->symbol); }
+          }
+          else if (d->k == N_FD)
+          {
+            // Function declaration - use d->symbol directly
+            if (d->symbol) { d->symbol->visibility |= 2; sv(&symbol_manager->uv, d->symbol); }
+          }
+          else if (d->k == N_TD)
+          {
+            // Type declaration - use d->symbol directly
+            if (d->symbol) {
+              d->symbol->visibility |= 2;
+              sv(&symbol_manager->uv, d->symbol);
+              // Also make enumeration literals visible
+              if (d->symbol->type_info && d->symbol->type_info->k == TYPE_ENUMERATION) {
+                for (uint32_t e = 0; e < d->symbol->type_info->enum_values.count; e++) {
+                  Symbol *esym = d->symbol->type_info->enum_values.data[e];
+                  if (esym) { esym->visibility |= 2; sv(&symbol_manager->uv, esym); }
+                }
+              }
+            }
+          }
+          else if (d->k == N_SD)
+          {
+            // Subtype declaration - use d->symbol directly
+            if (d->symbol) { d->symbol->visibility |= 2; sv(&symbol_manager->uv, d->symbol); }
+          }
+          else if (d->k == N_GD)
+          {
+            // Generic declaration - use d->symbol directly
+            if (d->symbol) { d->symbol->visibility |= 2; sv(&symbol_manager->uv, d->symbol); }
           }
           else if (d->symbol)
           {
@@ -9580,6 +9799,7 @@ static const char *ada_to_c_type_string(Type_Info *t)
   {
   case TYPE_BOOLEAN:
   case TYPE_CHARACTER:
+    return "i8";  // Always use i8 for boolean and character types
   case TYPE_INTEGER:
   case TYPE_UNSIGNED_INTEGER:
   case TYPE_ENUMERATION:
@@ -9710,13 +9930,31 @@ static int encode_symbol_name(char *b, int sz, Symbol *s, String_Slice nm, int p
         if (p and p->parameter.name.string)
           pnh = pnh * 31 + string_hash(p->parameter.name);
       }
+      // Include return type in hash to distinguish overloads with same parameters but different return types
+      unsigned long rth = 0;
+      if (sp->subprogram.return_type)
+      {
+        if (sp->subprogram.return_type->ty)
+          rth = type_hash(sp->subprogram.return_type->ty);
+        else if (sp->subprogram.return_type->k == N_ID and sp->subprogram.return_type->string_value.string)
+          rth = string_hash(sp->subprogram.return_type->string_value);
+      }
       if (n < sz - 1)
-        n += snprintf(b + n, sz - n, ".%d.%lx.%lu.%lx", pc, h % 0x10000, uid, pnh % 0x10000);
+        n += snprintf(b + n, sz - n, ".%d.%lx.%lu.%lx.%lx", pc, h % 0x10000, uid, pnh % 0x10000, rth % 0x10000);
     }
     else
     {
+      // For 0-parameter functions, include return type hash to distinguish overloads
+      unsigned long rth = 0;
+      if (sp and sp->subprogram.return_type)
+      {
+        if (sp->subprogram.return_type->ty)
+          rth = type_hash(sp->subprogram.return_type->ty);
+        else if (sp->subprogram.return_type->k == N_ID and sp->subprogram.return_type->string_value.string)
+          rth = string_hash(sp->subprogram.return_type->string_value);
+      }
       if (n < sz - 1)
-        n += snprintf(b + n, sz - n, ".%d.%lu.1", pc, uid);
+        n += snprintf(b + n, sz - n, ".%d.%lu.%lx", pc, uid, rth % 0x10000);
     }
     if (n >= sz)
       n = sz - 1;
@@ -9792,7 +10030,11 @@ static bool has_nested_function_in_stmts(Node_Vector *st)
 static bool has_nested_function(Node_Vector *dc, Node_Vector *st)
 {
   for (uint32_t i = 0; i < dc->count; i++)
-    if (dc->data[i] and (dc->data[i]->k == N_PB or dc->data[i]->k == N_FB))
+    // Check for procedure/function bodies, body stubs (N_PD/N_FD for IS SEPARATE),
+    // and generic instantiations (N_GINST) which create nested subprograms
+    if (dc->data[i] and (dc->data[i]->k == N_PB or dc->data[i]->k == N_FB
+                         or dc->data[i]->k == N_PD or dc->data[i]->k == N_FD
+                         or dc->data[i]->k == N_GINST))
       return 1;
   return has_nested_function_in_stmts(st);
 }
@@ -12590,7 +12832,8 @@ static void generate_statement_sequence(Code_Generator *generator, Syntax_Node *
       {
         // Use memcpy for array assignment
         int64_t count = st->high_bound - st->low_bound + 1;
-        int64_t elem_size = st->element_type->k == TYPE_INTEGER ? 8 : 4;
+        Type_Info *et = st->element_type ? type_canonical_concrete(st->element_type) : 0;
+        int64_t elem_size = et ? (et->k == TYPE_INTEGER ? 8 : (et->k == TYPE_CHARACTER or et->k == TYPE_BOOLEAN ? 1 : 4)) : 4;
         int64_t total_size = count * elem_size;
 
         // Get target address
@@ -14400,12 +14643,9 @@ static void generate_declaration(Code_Generator *generator, Syntax_Node *n)
                   // FLB optimization: store only upper bound, lower bound is compile-time constant
                   fprintf(o, "  %%t%d = alloca i64\n", bounds_ptr);
                   fprintf(o, "  store i64 %%t%d, ptr %%t%d\n", hi_val.id, bounds_ptr);
-
-                  // Mark this array type as having fixed lower bound in Type_Info
-                  if (at and at->low_bound != fixed_lb_value)
-                  {
-                    at->low_bound = fixed_lb_value;
-                  }
+                  // Note: Don't modify at->low_bound here - fat pointer storage means bounds
+                  // are stored at runtime, not in type_info. Assignment code uses type_info
+                  // bounds to distinguish fat pointer ({ptr,ptr}) from fixed array ([N x type]).
                 }
                 else
                 {
@@ -14666,8 +14906,19 @@ static void generate_declaration(Code_Generator *generator, Syntax_Node *n)
   {
     generator->current_function = n;
     Syntax_Node *sp = n->body.subprogram_spec;
-    Generic_Template *gt = generic_find(generator->sm, sp->subprogram.name);
-    if (gt)
+    // Check if this is ANY generic template's body - if so, skip it
+    // We need to check all generics since scope tracking differs between resolution and codegen
+    int is_generic_body = 0;
+    for (uint32_t gi = 0; gi < generator->sm->gt.count; gi++)
+    {
+      Generic_Template *gti = generator->sm->gt.data[gi];
+      if (gti and gti->body == n)
+      {
+        is_generic_body = 1;
+        break;
+      }
+    }
+    if (is_generic_body)
     {
       generator->current_function = 0;
       break;
@@ -14735,7 +14986,13 @@ static void generate_declaration(Code_Generator *generator, Syntax_Node *n)
           if (s->k == 0 and s->elaboration_level >= 0 and s->elaboration_level > mx)
             mx = s->elaboration_level;
       if (mx == 0)
-        fprintf(o, "  %%__frame = bitcast ptr %%__slnk to ptr\n");
+      {
+        // If level > 0, we have %__slnk to alias; otherwise allocate minimal frame
+        if (n->symbol and n->symbol->level > 0)
+          fprintf(o, "  %%__frame = bitcast ptr %%__slnk to ptr\n");
+        else
+          fprintf(o, "  %%__frame = alloca [1 x ptr]\n");
+      }
     }
     if (n->symbol and n->symbol->level > 0)
     {
@@ -15011,8 +15268,18 @@ static void generate_declaration(Code_Generator *generator, Syntax_Node *n)
   {
     generator->current_function = n;
     Syntax_Node *sp = n->body.subprogram_spec;
-    Generic_Template *gt = generic_find(generator->sm, sp->subprogram.name);
-    if (gt)
+    // Check if this is ANY generic template's body - if so, skip it
+    int is_generic_body = 0;
+    for (uint32_t gi = 0; gi < generator->sm->gt.count; gi++)
+    {
+      Generic_Template *gti = generator->sm->gt.data[gi];
+      if (gti and gti->body == n)
+      {
+        is_generic_body = 1;
+        break;
+      }
+    }
+    if (is_generic_body)
     {
       generator->current_function = 0;
       break;
@@ -15082,7 +15349,13 @@ static void generate_declaration(Code_Generator *generator, Syntax_Node *n)
           if (s->k == 0 and s->elaboration_level >= 0 and s->elaboration_level > mx)
             mx = s->elaboration_level;
       if (mx == 0)
-        fprintf(o, "  %%__frame = bitcast ptr %%__slnk to ptr\n");
+      {
+        // If level > 0, we have %__slnk to alias; otherwise allocate minimal frame
+        if (n->symbol and n->symbol->level > 0)
+          fprintf(o, "  %%__frame = bitcast ptr %%__slnk to ptr\n");
+        else
+          fprintf(o, "  %%__frame = alloca [1 x ptr]\n");
+      }
     }
     if (n->symbol and n->symbol->level > 0)
     {
@@ -15345,7 +15618,14 @@ static void generate_declaration(Code_Generator *generator, Syntax_Node *n)
 }
 static void generate_expression_llvm(Code_Generator *generator, Syntax_Node *n)
 {
-  if (n and n->k == N_PKB and n->package_body.statements.count > 0)
+  if (not n)
+    return;
+  if (n->k == N_PB or n->k == N_FB)
+  {
+    // Generate instantiated procedure/function body
+    generate_declaration(generator, n);
+  }
+  else if (n->k == N_PKB and n->package_body.statements.count > 0)
   {
     Symbol *ps = symbol_find(generator->sm, n->package_body.name);
     if (ps and ps->k == 11)
@@ -15537,6 +15817,128 @@ static void generate_runtime_type(Code_Generator *generator)
   //     "define linkonce_odr void @__text_io_get_line(ptr %%b,ptr %%n){store i64 0,ptr %%n\nret "
   //     "void}\n");
   fprintf(o, "declare i32 @putchar(i32)\ndeclare i32 @getchar()\n");
+  // C file I/O functions for TEXT_IO
+  fprintf(o,
+      "declare ptr @fopen(ptr,ptr)\ndeclare i32 @fclose(ptr)\n"
+      "declare i32 @fputc(i32,ptr)\ndeclare i32 @fgetc(ptr)\n"
+      "declare i32 @ungetc(i32,ptr)\ndeclare i32 @feof(ptr)\n"
+      "declare i32 @fflush(ptr)\ndeclare i32 @remove(ptr)\n"
+      "declare i64 @ftell(ptr)\ndeclare i32 @fseek(ptr,i64,i32)\n");
+  // Standard file accessors for TEXT_IO
+  fprintf(o,
+      "define linkonce_odr ptr @__ada_stdin(){%%p=load ptr,ptr @stdin\nret ptr %%p}\n"
+      "define linkonce_odr ptr @__ada_stdout(){%%p=load ptr,ptr @stdout\nret ptr %%p}\n"
+      "define linkonce_odr ptr @__ada_stderr(){%%p=load ptr,ptr @stderr\nret ptr %%p}\n");
+  // Calendar package support - time functions
+  fprintf(o,
+      "declare i64 @time(ptr)\n"
+      "declare ptr @localtime(ptr)\n"
+      "declare i64 @mktime(ptr)\n");
+  // __ada_clock returns current time as seconds since epoch
+  fprintf(o,
+      "define linkonce_odr i64 @__ada_clock(){\n"
+      "  %%t = call i64 @time(ptr null)\n"
+      "  ret i64 %%t\n"
+      "}\n");
+  // __ada_year extracts year from time (tm_year + 1900)
+  fprintf(o,
+      "define linkonce_odr i32 @__ada_year(i64 %%t){\n"
+      "  %%tp = alloca i64\n"
+      "  store i64 %%t, ptr %%tp\n"
+      "  %%tm = call ptr @localtime(ptr %%tp)\n"
+      "  %%isnull = icmp eq ptr %%tm, null\n"
+      "  br i1 %%isnull, label %%null_case, label %%ok\n"
+      "ok:\n"
+      "  %%yptr = getelementptr i32, ptr %%tm, i32 5\n"
+      "  %%yr = load i32, ptr %%yptr\n"
+      "  %%year = add i32 %%yr, 1900\n"
+      "  ret i32 %%year\n"
+      "null_case:\n"
+      "  ret i32 1901\n"
+      "}\n");
+  // __ada_month extracts month from time (tm_mon + 1)
+  fprintf(o,
+      "define linkonce_odr i32 @__ada_month(i64 %%t){\n"
+      "  %%tp = alloca i64\n"
+      "  store i64 %%t, ptr %%tp\n"
+      "  %%tm = call ptr @localtime(ptr %%tp)\n"
+      "  %%isnull = icmp eq ptr %%tm, null\n"
+      "  br i1 %%isnull, label %%null_case, label %%ok\n"
+      "ok:\n"
+      "  %%mptr = getelementptr i32, ptr %%tm, i32 4\n"
+      "  %%mn = load i32, ptr %%mptr\n"
+      "  %%month = add i32 %%mn, 1\n"
+      "  ret i32 %%month\n"
+      "null_case:\n"
+      "  ret i32 1\n"
+      "}\n");
+  // __ada_day extracts day from time (tm_mday)
+  fprintf(o,
+      "define linkonce_odr i32 @__ada_day(i64 %%t){\n"
+      "  %%tp = alloca i64\n"
+      "  store i64 %%t, ptr %%tp\n"
+      "  %%tm = call ptr @localtime(ptr %%tp)\n"
+      "  %%isnull = icmp eq ptr %%tm, null\n"
+      "  br i1 %%isnull, label %%null_case, label %%ok\n"
+      "ok:\n"
+      "  %%dptr = getelementptr i32, ptr %%tm, i32 3\n"
+      "  %%day = load i32, ptr %%dptr\n"
+      "  ret i32 %%day\n"
+      "null_case:\n"
+      "  ret i32 1\n"
+      "}\n");
+  // __ada_seconds extracts seconds within day (hour*3600 + min*60 + sec)
+  fprintf(o,
+      "define linkonce_odr double @__ada_seconds(i64 %%t){\n"
+      "  %%tp = alloca i64\n"
+      "  store i64 %%t, ptr %%tp\n"
+      "  %%tm = call ptr @localtime(ptr %%tp)\n"
+      "  %%isnull = icmp eq ptr %%tm, null\n"
+      "  br i1 %%isnull, label %%null_case, label %%ok\n"
+      "ok:\n"
+      "  %%hptr = getelementptr i32, ptr %%tm, i32 2\n"
+      "  %%hour = load i32, ptr %%hptr\n"
+      "  %%mptr = getelementptr i32, ptr %%tm, i32 1\n"
+      "  %%min = load i32, ptr %%mptr\n"
+      "  %%sptr = getelementptr i32, ptr %%tm, i32 0\n"
+      "  %%sec = load i32, ptr %%sptr\n"
+      "  %%h3600 = mul i32 %%hour, 3600\n"
+      "  %%m60 = mul i32 %%min, 60\n"
+      "  %%hm = add i32 %%h3600, %%m60\n"
+      "  %%total = add i32 %%hm, %%sec\n"
+      "  %%result = sitofp i32 %%total to double\n"
+      "  ret double %%result\n"
+      "null_case:\n"
+      "  ret double 0.0\n"
+      "}\n");
+  // __ada_time_of creates time from year, month, day, seconds
+  fprintf(o,
+      "define linkonce_odr i64 @__ada_time_of(i32 %%year, i32 %%month, i32 %%day, double %%secs){\n"
+      "  %%tm = alloca [64 x i8]\n"
+      "  call void @llvm.memset.p0.i64(ptr %%tm, i8 0, i64 64, i1 false)\n"
+      "  %%yr = sub i32 %%year, 1900\n"
+      "  %%yptr = getelementptr i32, ptr %%tm, i32 5\n"
+      "  store i32 %%yr, ptr %%yptr\n"
+      "  %%mn = sub i32 %%month, 1\n"
+      "  %%mptr = getelementptr i32, ptr %%tm, i32 4\n"
+      "  store i32 %%mn, ptr %%mptr\n"
+      "  %%dptr = getelementptr i32, ptr %%tm, i32 3\n"
+      "  store i32 %%day, ptr %%dptr\n"
+      "  %%secsi = fptosi double %%secs to i32\n"
+      "  %%hour = sdiv i32 %%secsi, 3600\n"
+      "  %%rem1 = srem i32 %%secsi, 3600\n"
+      "  %%min = sdiv i32 %%rem1, 60\n"
+      "  %%sec = srem i32 %%rem1, 60\n"
+      "  %%hptr = getelementptr i32, ptr %%tm, i32 2\n"
+      "  store i32 %%hour, ptr %%hptr\n"
+      "  %%minptr = getelementptr i32, ptr %%tm, i32 1\n"
+      "  store i32 %%min, ptr %%minptr\n"
+      "  %%secptr = getelementptr i32, ptr %%tm, i32 0\n"
+      "  store i32 %%sec, ptr %%secptr\n"
+      "  %%result = call i64 @mktime(ptr %%tm)\n"
+      "  ret i64 %%result\n"
+      "}\n"
+      "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n");
   fprintf(
       o,
       // __ada_image_enum returns a fat pointer {ptr, ptr} like __ada_image_int
@@ -16310,18 +16712,20 @@ int main(int ac, char **av)
         if (s->elaboration_level == i and s->level == 0)
           for (uint32_t k = 0; k < s->overloads.count; k++)
             generate_declaration(&g, s->overloads.data[k]);
+  // Generate SEPARATE bodies (they have level > 0 but are top-level compilation units)
+  for (uint32_t ui = 0; ui < cu->compilation_unit.units.count; ui++)
+  {
+    Syntax_Node *u = cu->compilation_unit.units.data[ui];
+    if ((u->k == N_PB or u->k == N_FB) and u->symbol and u->symbol->level > 0)
+      generate_declaration(&g, u);
+  }
   for (uint32_t ui = 0; ui < cu->compilation_unit.units.count; ui++)
   {
     Syntax_Node *u = cu->compilation_unit.units.data[ui];
     if (u->k == N_PKB)
       generate_expression_llvm(&g, u);
   }
-  for (uint32_t ui = 0; ui < cu->compilation_unit.units.count; ui++)
-  {
-    Syntax_Node *u = cu->compilation_unit.units.data[ui];
-    if (u->k == N_PB or u->k == N_FB)
-      generate_expression_llvm(&g, u);
-  }
+  // Process instantiated generic bodies from sm.ib
   for (uint32_t i = 0; i < sm.ib.count; i++)
     generate_expression_llvm(&g, sm.ib.data[i]);
   for (uint32_t ui = cu->compilation_unit.units.count; ui > 0; ui--)
