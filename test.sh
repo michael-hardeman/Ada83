@@ -82,7 +82,6 @@ U(){ cat<<E
 Usage: $0 <mode> [options]
 
 Modes:
-  f, full         Run complete ACATS test suite
   g <X> [v]       Run all tests for class X (A/B/C/D/E/L)
   q <XX> [v]      Run tests for group XX (e.g., a21, b22, c32)
   b [v]           Run B-test error coverage analysis
