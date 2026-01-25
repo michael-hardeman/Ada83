@@ -58,17 +58,17 @@ static inline int  Is_Space(char c)   { return isspace((unsigned char)c); }
 static inline char To_Lower(char c)   { return (char)tolower((unsigned char)c); }
 static inline char To_Upper(char c)   { return (char)toupper((unsigned char)c); }
 
-/* Bits Per Unit — the addressable quantum (universally 8 on modern targets) */
+/* Universally 8 on modern targets */
 enum { Bits_Per_Unit = 8 };
 
-/* LLVM integer widths in bits — the atoms of representation */
+/* LLVM integer widths in bits */
 typedef enum {
     Width_1   = 1,    Width_8   = 8,    Width_16  = 16,
     Width_32  = 32,   Width_64  = 64,   Width_128 = 128,
     Width_Ptr = 64,   Width_Float = 32, Width_Double = 64
 } Bit_Width;
 
-/* Ada standard integer widths per RM §3.5.4 and GNAT conventions */
+/* Ada standard integer widths per RM §3.5.4 */
 typedef enum {
     Ada_Short_Short_Integer_Bits = Width_8,
     Ada_Short_Integer_Bits       = Width_16,
