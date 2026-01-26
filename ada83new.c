@@ -2,7 +2,7 @@
  * Ada83 - An Ada 1983 (ANSI/MIL-STD-1815A) compiler targeting LLVM IR
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * §0  SIMD Optimizations - Assembly magic for big numbers and parsing
+ * §0  SIMD Optimizations - Assembly setup for big numbers and parsing
  * §1  Type_Metrics       - Representation details
  * §2  Memory_Arena       - Bump allocation for AST nodes
  * §3  String_Slice       - Non-owning string views
@@ -54,20 +54,12 @@
 /* Detect architecture at compile time */
 #if defined(__x86_64__) || defined(_M_X64)
     #define SIMD_X86_64 1
-    /* Compile flags: -O3 -march=x86-64-v4 -masm=intel
-     * Expected: vmovdqu8, vpcmpeqb with k-mask, kmovq instructions */
 #elif defined(__aarch64__) || defined(_M_ARM64)
     #define SIMD_ARM64 1
-    /* Compile flags: -O3 -march=armv8-a+simd
-     * Expected: ld1 {v0.16b}, cmeq v0.16b, umov instructions */
 #elif defined(__riscv) && defined(__riscv_v)
     #define SIMD_RISCV_V 1
-    /* Compile flags: -O3 -march=rv64gcv -mabi=lp64d
-     * Expected: vle8.v, vmseq.vi, vfirst.m instructions */
 #elif defined(__riscv)
     #define SIMD_RISCV_SCALAR 1
-    /* RISC-V without V extension - use optimized scalar loops
-     * Leverage RISC-V's clean register file for aggressive unrolling */
 #else
     #define SIMD_GENERIC 1
 #endif
@@ -2493,6 +2485,7 @@ struct Syntax_Node {
         /* NK_LOOP */
         struct {
             String_Slice label;
+            Symbol *label_symbol;           /* Pre-registered label for GOTO */
             Syntax_Node *iteration_scheme;  /* for/while condition */
             Node_List statements;
             bool is_reverse;
@@ -2501,6 +2494,7 @@ struct Syntax_Node {
         /* NK_BLOCK */
         struct {
             String_Slice label;
+            Symbol *label_symbol;           /* Pre-registered label for GOTO */
             Node_List declarations;
             Node_List statements;
             Node_List handlers;
@@ -6130,6 +6124,7 @@ struct Symbol {
     bool            extern_emitted;      /* Extern declaration already emitted */
     bool            is_named_number;     /* Named number (constant without explicit type) */
     bool            is_overloaded;       /* Part of an overload set (needs unique_id suffix) */
+    bool            body_claimed;        /* Body has been matched to this spec (for homographs) */
 
     /* LLVM label ID for SYMBOL_LABEL */
     uint32_t        llvm_label_id;       /* 0 = not yet assigned */
@@ -8159,17 +8154,41 @@ static void Resolve_Declaration_List(Symbol_Manager *sm, Node_List *list);
 static void Freeze_Declaration_List(Node_List *list);
 static void Populate_Package_Exports(Symbol *pkg_sym, Syntax_Node *pkg_spec);
 
-/* Pre-register labels in a statement list to allow forward gotos */
+/* Pre-register labels in a statement list to allow forward gotos.
+ * Labels can appear as:
+ *   1. NK_LABEL nodes wrapping other statements
+ *   2. The .label field of NK_BLOCK or NK_LOOP nodes (Ada allows naming blocks/loops) */
 static void Preregister_Labels(Symbol_Manager *sm, Node_List *list) {
     for (uint32_t i = 0; i < list->count; i++) {
         Syntax_Node *node = list->items[i];
-        if (node && node->kind == NK_LABEL) {
-            Symbol *label_sym = Symbol_New(SYMBOL_LABEL,
-                                           node->label_node.name,
-                                           node->location);
+        if (!node) continue;
+
+        String_Slice label_name = Empty_Slice;
+        Source_Location label_loc = node->location;
+        Symbol **label_sym_ptr = NULL;
+
+        switch (node->kind) {
+            case NK_LABEL:
+                label_name = node->label_node.name;
+                label_sym_ptr = &node->label_node.symbol;
+                break;
+            case NK_BLOCK:
+                label_name = node->block_stmt.label;
+                label_sym_ptr = &node->block_stmt.label_symbol;
+                break;
+            case NK_LOOP:
+                label_name = node->loop_stmt.label;
+                label_sym_ptr = &node->loop_stmt.label_symbol;
+                break;
+            default:
+                break;
+        }
+
+        if (label_name.data && label_name.length > 0) {
+            Symbol *label_sym = Symbol_New(SYMBOL_LABEL, label_name, label_loc);
             label_sym->type = sm->type_address;
             Symbol_Add(sm, label_sym);
-            node->label_node.symbol = label_sym;
+            if (label_sym_ptr) *label_sym_ptr = label_sym;
         }
     }
 }
@@ -8357,6 +8376,8 @@ static void Resolve_Statement(Symbol_Manager *sm, Syntax_Node *node) {
 static void Resolve_Declaration(Symbol_Manager *sm, Syntax_Node *node);
 static char *Lookup_Path(String_Slice name);
 static void Load_Package_Spec(Symbol_Manager *sm, String_Slice name, char *src);
+static bool Body_Already_Loaded(String_Slice name);
+static void Mark_Body_Loaded(String_Slice name);
 
 static void Resolve_Declaration_List(Symbol_Manager *sm, Node_List *list) {
     for (uint32_t i = 0; i < list->count; i++) {
@@ -8423,6 +8444,8 @@ static void Populate_Package_Exports(Symbol *pkg_sym, Syntax_Node *pkg_spec) {
             count += (uint32_t)decl->exception_decl.names.count;
         } else if (decl->kind == NK_PACKAGE_SPEC) {
             count++;  /* Nested packages */
+        } else if (decl->kind == NK_GENERIC_DECL) {
+            count++;  /* Nested generics (e.g., TEXT_IO.INTEGER_IO) */
         }
     }
 
@@ -8467,6 +8490,9 @@ static void Populate_Package_Exports(Symbol *pkg_sym, Syntax_Node *pkg_spec) {
             }
         } else if (decl->kind == NK_PACKAGE_SPEC && decl->symbol) {
             pkg_sym->exported[pkg_sym->exported_count++] = decl->symbol;
+        } else if (decl->kind == NK_GENERIC_DECL && decl->symbol) {
+            /* Export nested generic packages/subprograms (e.g., TEXT_IO.INTEGER_IO) */
+            pkg_sym->exported[pkg_sym->exported_count++] = decl->symbol;
         }
     }
 }
@@ -8486,24 +8512,10 @@ static void Resolve_Declaration(Symbol_Manager *sm, Syntax_Node *node) {
             }
             /* Resolve initializer/renamed object - propagate type to aggregates first */
             if (node->object_decl.init) {
+                /* Propagate type to aggregate initializer from declared type */
                 if (node->object_decl.init->kind == NK_AGGREGATE &&
                     node->object_decl.object_type && node->object_decl.object_type->type) {
                     node->object_decl.init->type = node->object_decl.object_type->type;
-                    fprintf(stderr, "DEBUG2: Set init aggregate type from object_type to %.*s\n",
-                            (int)node->object_decl.init->type->name.length,
-                            node->object_decl.init->type->name.data);
-                } else if (node->object_decl.init->kind == NK_AGGREGATE) {
-                    fprintf(stderr, "DEBUG2: Aggregate init without object_type->type, object_type=%p kind=%d type=%p\n",
-                            (void*)node->object_decl.object_type,
-                            node->object_decl.object_type ? node->object_decl.object_type->kind : -1,
-                            node->object_decl.object_type ? (void*)node->object_decl.object_type->type : NULL);
-                    if (node->object_decl.object_type && node->object_decl.object_type->kind == NK_SELECTED) {
-                        Symbol *prefix_sym = node->object_decl.object_type->selected.prefix->symbol;
-                        fprintf(stderr, "DEBUG2: Selected prefix symbol=%p kind=%d exported_count=%u\n",
-                                (void*)prefix_sym,
-                                prefix_sym ? prefix_sym->kind : -1,
-                                prefix_sym ? prefix_sym->exported_count : 0);
-                    }
                 }
                 Resolve_Expression(sm, node->object_decl.init);
             }
@@ -8650,20 +8662,7 @@ static void Resolve_Declaration(Symbol_Manager *sm, Syntax_Node *node) {
         case NK_PROCEDURE_SPEC:
         case NK_FUNCTION_SPEC:
             {
-                /* Check if there's already a matching symbol from package spec.
-                 * This happens when resolving a subprogram body that completes a spec. */
-                Symbol *sym = Symbol_Find(sm, node->subprogram_spec.name);
-                Symbol_Kind expected_kind = node->kind == NK_PROCEDURE_SPEC ?
-                                           SYMBOL_PROCEDURE : SYMBOL_FUNCTION;
-                if (sym && sym->kind == expected_kind) {
-                    /* Use existing symbol from spec */
-                    node->symbol = sym;
-                    break;
-                }
-
-                sym = Symbol_New(expected_kind, node->subprogram_spec.name, node->location);
-
-                /* Count total parameters (each param_spec can have multiple names) */
+                /* Count total parameters first (needed for overload matching) */
                 Node_List *param_list = &node->subprogram_spec.parameters;
                 uint32_t total_params = 0;
                 for (uint32_t i = 0; i < param_list->count; i++) {
@@ -8673,6 +8672,50 @@ static void Resolve_Declaration(Symbol_Manager *sm, Syntax_Node *node) {
                     }
                 }
 
+                /* Check if there's already a matching symbol from package spec.
+                 * This happens when resolving a subprogram body that completes a spec.
+                 * For overloaded subprograms, must match parameter count AND types. */
+                Symbol_Kind expected_kind = node->kind == NK_PROCEDURE_SPEC ?
+                                           SYMBOL_PROCEDURE : SYMBOL_FUNCTION;
+                Symbol *sym = Symbol_Find(sm, node->subprogram_spec.name);
+                while (sym) {
+                    if (sym->kind == expected_kind && sym->parameter_count == total_params) {
+                        /* Check parameter types match */
+                        bool types_match = true;
+                        uint32_t param_idx = 0;
+                        for (uint32_t i = 0; i < param_list->count && types_match; i++) {
+                            Syntax_Node *ps = param_list->items[i];
+                            if (ps->kind == NK_PARAM_SPEC) {
+                                /* Resolve param type first */
+                                if (ps->param_spec.param_type) {
+                                    Resolve_Expression(sm, ps->param_spec.param_type);
+                                }
+                                Type_Info *body_type = ps->param_spec.param_type ?
+                                                       ps->param_spec.param_type->type : NULL;
+                                for (uint32_t j = 0; j < ps->param_spec.names.count; j++) {
+                                    if (param_idx < sym->parameter_count) {
+                                        Type_Info *spec_type = sym->parameters[param_idx].param_type;
+                                        if (body_type != spec_type) {
+                                            types_match = false;
+                                            break;
+                                        }
+                                    }
+                                    param_idx++;
+                                }
+                            }
+                        }
+                        /* Found matching spec - check it's not already claimed */
+                        if (types_match && !sym->body_claimed) {
+                            sym->body_claimed = true;
+                            node->symbol = sym;
+                            goto spec_matched;
+                        }
+                    }
+                    sym = sym->next_overload;
+                }
+
+                /* No matching spec found - create new symbol */
+                sym = Symbol_New(expected_kind, node->subprogram_spec.name, node->location);
                 sym->parameter_count = total_params;
                 if (total_params > 0) {
                     sym->parameters = Arena_Allocate(total_params * sizeof(Parameter_Info));
@@ -8704,6 +8747,7 @@ static void Resolve_Declaration(Symbol_Manager *sm, Syntax_Node *node) {
                 }
                 Symbol_Add(sm, sym);
                 node->symbol = sym;
+            spec_matched:;
             }
             break;
 
@@ -9023,6 +9067,9 @@ static void Resolve_Declaration(Symbol_Manager *sm, Syntax_Node *node) {
 
                 /* Handle generic packages: formals and unit are in the generic declaration */
                 if (pkg_sym && pkg_sym->kind == SYMBOL_GENERIC) {
+                    /* Store this body as the generic's body for later instantiation */
+                    pkg_sym->generic_body = node;
+
                     /* Install generic formal parameters first */
                     if (pkg_sym->declaration &&
                         pkg_sym->declaration->kind == NK_GENERIC_DECL) {
@@ -9523,11 +9570,6 @@ static void Resolve_Declaration(Symbol_Manager *sm, Syntax_Node *node) {
                                 if (!expr->type || expr->kind == NK_AGGREGATE) {
                                     expr->type = obj_type;
                                 }
-                                fprintf(stderr, "DEBUG: Set aggregate type to %.*s\n",
-                                        (int)obj_type->name.length, obj_type->name.data);
-                            } else {
-                                fprintf(stderr, "DEBUG: No obj_type found, actual=%p obj_type=%p\n",
-                                        (void*)actual, (void*)obj_type);
                             }
                         }
                     }
@@ -9729,11 +9771,13 @@ static void Resolve_Declaration(Symbol_Manager *sm, Syntax_Node *node) {
                                 }
                                 else if (decl->kind == NK_PROCEDURE_SPEC ||
                                          decl->kind == NK_FUNCTION_SPEC) {
-                                    /* Create subprogram symbol with instantiated types */
+                                    /* Create subprogram symbol with instantiated types.
+                                     * Assign unique_id immediately so homographs get distinct IDs. */
                                     String_Slice name = decl->subprogram_spec.name;
                                     Symbol_Kind sk = (decl->kind == NK_PROCEDURE_SPEC) ?
                                                      SYMBOL_PROCEDURE : SYMBOL_FUNCTION;
                                     Symbol *exp = Symbol_New(sk, name, decl->location);
+                                    exp->unique_id = sm->next_unique_id++;
                                     exp->declaration = decl;
                                     exp->parent = inst_sym;
                                     exp->generic_template = template;
@@ -12529,7 +12573,24 @@ static void Generate_Statement(Code_Generator *cg, Syntax_Node *node);
 
 static void Generate_Statement_List(Code_Generator *cg, Node_List *list) {
     for (uint32_t i = 0; i < list->count; i++) {
-        Generate_Statement(cg, list->items[i]);
+        Syntax_Node *stmt = list->items[i];
+        if (!stmt) continue;
+
+        /* After a terminator (ret/br), we need a new basic block.
+         * Labeled statements (NK_LABEL, NK_BLOCK with label, NK_LOOP with label)
+         * emit their own labels. For unlabeled statements, emit a fresh label. */
+        if (cg->block_terminated) {
+            bool will_emit_label = stmt->kind == NK_LABEL ||
+                (stmt->kind == NK_BLOCK && stmt->block_stmt.label_symbol) ||
+                (stmt->kind == NK_LOOP && stmt->loop_stmt.label_symbol);
+            if (!will_emit_label) {
+                uint32_t dead_label = cg->label_id++;
+                Emit(cg, "L%u:  ; unreachable\n", dead_label);
+                cg->block_terminated = false;
+            }
+        }
+
+        Generate_Statement(cg, stmt);
     }
 }
 
@@ -12899,6 +12960,18 @@ static void Generate_If_Statement(Code_Generator *cg, Syntax_Node *node) {
 }
 
 static void Generate_Loop_Statement(Code_Generator *cg, Syntax_Node *node) {
+    /* Emit LLVM label for Ada label (enables GOTO targeting this loop) */
+    Symbol *label_sym = node->loop_stmt.label_symbol;
+    if (label_sym) {
+        if (label_sym->llvm_label_id == 0)
+            label_sym->llvm_label_id = cg->label_id++;
+        if (!cg->block_terminated)
+            Emit(cg, "  br label %%L%u\n", label_sym->llvm_label_id);
+        Emit(cg, "L%u:  ; %.*s\n", label_sym->llvm_label_id,
+             (int)node->loop_stmt.label.length, node->loop_stmt.label.data);
+        cg->block_terminated = false;  /* New block started */
+    }
+
     uint32_t loop_start = Emit_Label(cg);
     uint32_t loop_body = Emit_Label(cg);
     uint32_t loop_end = Emit_Label(cg);
@@ -13024,15 +13097,15 @@ static void Generate_Case_Statement(Code_Generator *cg, Syntax_Node *node) {
     /* Generate alternative bodies - expression is a block with statements */
     for (uint32_t i = 0; i < num_alts; i++) {
         Syntax_Node *alt = node->case_stmt.alternatives.items[i];
-        Emit(cg, "L%u:\n", alt_labels[i]);
+        Emit_Label_Here(cg, alt_labels[i]);
         if (alt->association.expression &&
             alt->association.expression->kind == NK_BLOCK) {
             Generate_Statement_List(cg, &alt->association.expression->block_stmt.statements);
         }
-        Emit(cg, "  br label %%L%u\n", end_label);
+        Emit_Branch_If_Needed(cg, end_label);
     }
 
-    Emit(cg, "L%u:\n", end_label);
+    Emit_Label_Here(cg, end_label);
 }
 
 static void Generate_For_Loop(Code_Generator *cg, Syntax_Node *node) {
@@ -13238,6 +13311,18 @@ static void Generate_Raise_Statement(Code_Generator *cg, Syntax_Node *node) {
 }
 
 static void Generate_Block_Statement(Code_Generator *cg, Syntax_Node *node) {
+    /* Emit LLVM label for Ada label (enables GOTO targeting this block) */
+    Symbol *label_sym = node->block_stmt.label_symbol;
+    if (label_sym) {
+        if (label_sym->llvm_label_id == 0)
+            label_sym->llvm_label_id = cg->label_id++;
+        if (!cg->block_terminated)
+            Emit(cg, "  br label %%L%u\n", label_sym->llvm_label_id);
+        Emit(cg, "L%u:  ; %.*s\n", label_sym->llvm_label_id,
+             (int)node->block_stmt.label.length, node->block_stmt.label.data);
+        cg->block_terminated = false;  /* New block started */
+    }
+
     /* Block with optional declarations and exception handlers */
     bool has_handlers = node->block_stmt.handlers.count > 0;
 
@@ -13718,14 +13803,15 @@ static void Generate_Statement(Code_Generator *cg, Syntax_Node *node) {
                 /* Ada label - allocate LLVM label ID and emit label */
                 Symbol *label_sym = node->label_node.symbol;
                 if (label_sym) {
-                    if (label_sym->llvm_label_id == 0) {
+                    if (label_sym->llvm_label_id == 0)
                         label_sym->llvm_label_id = cg->label_id++;
-                    }
-                    /* Need a branch to the label to terminate previous block */
-                    Emit(cg, "  br label %%L%u\n", label_sym->llvm_label_id);
+                    /* Need a branch to the label to terminate previous block (if not already) */
+                    if (!cg->block_terminated)
+                        Emit(cg, "  br label %%L%u\n", label_sym->llvm_label_id);
                     Emit(cg, "L%u:  ; %.*s\n", label_sym->llvm_label_id,
                          (int)node->label_node.name.length,
                          node->label_node.name.data);
+                    cg->block_terminated = false;  /* New block started */
                 }
                 /* Generate the labeled statement */
                 if (node->label_node.statement) {
@@ -14290,6 +14376,48 @@ static void Generate_Generic_Instance_Body(Code_Generator *cg, Symbol *inst_sym,
                                            Syntax_Node *template_body) {
     if (!inst_sym || !template_body) return;
 
+    /* Handle package instantiation specially: iterate through exported
+     * subprograms and generate each one with its own symbol. */
+    if (inst_sym->kind == SYMBOL_PACKAGE && template_body->kind == NK_PACKAGE_BODY) {
+        for (uint32_t i = 0; i < inst_sym->exported_count; i++) {
+            Symbol *exp = inst_sym->exported[i];
+            if (!exp) continue;
+            if (exp->kind != SYMBOL_FUNCTION && exp->kind != SYMBOL_PROCEDURE)
+                continue;
+
+            /* Count which Nth homograph this is in the export list */
+            uint32_t homograph_idx = 0;
+            for (uint32_t k = 0; k < i; k++) {
+                Symbol *prev = inst_sym->exported[k];
+                if (prev && (prev->kind == SYMBOL_FUNCTION || prev->kind == SYMBOL_PROCEDURE) &&
+                    Slice_Equal_Ignore_Case(prev->name, exp->name)) {
+                    homograph_idx++;
+                }
+            }
+
+            /* Find the Nth body with this name */
+            Syntax_Node *subp_body = NULL;
+            uint32_t body_homograph_idx = 0;
+            for (uint32_t j = 0; j < template_body->package_body.declarations.count; j++) {
+                Syntax_Node *decl = template_body->package_body.declarations.items[j];
+                if (!decl) continue;
+                if (decl->kind == NK_PROCEDURE_BODY || decl->kind == NK_FUNCTION_BODY) {
+                    if (Slice_Equal_Ignore_Case(decl->subprogram_body.specification->subprogram_spec.name, exp->name)) {
+                        if (body_homograph_idx == homograph_idx) {
+                            subp_body = decl;
+                            break;
+                        }
+                        body_homograph_idx++;
+                    }
+                }
+            }
+            if (subp_body) {
+                Generate_Generic_Instance_Body(cg, exp, subp_body);
+            }
+        }
+        return;
+    }
+
     bool is_function = inst_sym->kind == SYMBOL_FUNCTION;
     uint32_t saved_deferred_count = cg->deferred_count;
 
@@ -14481,8 +14609,13 @@ static void Generate_Declaration(Code_Generator *cg, Syntax_Node *node) {
         case NK_PACKAGE_BODY:
             /* First, emit package spec's object declarations (constants, variables) */
             {
-                String_Slice pkg_name = node->package_body.name;
-                Symbol *pkg_sym = Symbol_Find(cg->sm, pkg_name);
+                Symbol *pkg_sym = node->symbol;  /* Use symbol from semantic analysis */
+
+                /* Skip generic package bodies - code is generated only for instances */
+                if (pkg_sym && pkg_sym->kind == SYMBOL_GENERIC) {
+                    break;
+                }
+
                 if (pkg_sym && pkg_sym->kind == SYMBOL_PACKAGE && pkg_sym->declaration) {
                     Syntax_Node *spec = pkg_sym->declaration;
                     if (spec->kind == NK_PACKAGE_SPEC) {
@@ -14528,6 +14661,49 @@ static void Generate_Declaration(Code_Generator *cg, Syntax_Node *node) {
                 if (cg->current_function && cg->deferred_count < 64) {
                     /* Defer nested generic instance - emit after enclosing function */
                     cg->deferred_bodies[cg->deferred_count++] = node;
+                } else if (inst_sym->kind == SYMBOL_PACKAGE) {
+                    /* Generic PACKAGE instantiation: iterate exported subprograms
+                     * and generate each one using its own symbol (with unique_id).
+                     * Match by counting which Nth homograph this is in the export list,
+                     * then finding the Nth body with the same name. */
+                    if (generic_body->kind == NK_PACKAGE_BODY) {
+                        for (uint32_t i = 0; i < inst_sym->exported_count; i++) {
+                            Symbol *exp = inst_sym->exported[i];
+                            if (!exp) continue;
+                            if (exp->kind != SYMBOL_FUNCTION && exp->kind != SYMBOL_PROCEDURE)
+                                continue;
+
+                            /* Count how many times this name appeared before in exports */
+                            uint32_t homograph_idx = 0;
+                            for (uint32_t k = 0; k < i; k++) {
+                                Symbol *prev = inst_sym->exported[k];
+                                if (prev && (prev->kind == SYMBOL_FUNCTION || prev->kind == SYMBOL_PROCEDURE) &&
+                                    Slice_Equal_Ignore_Case(prev->name, exp->name)) {
+                                    homograph_idx++;
+                                }
+                            }
+
+                            /* Find the Nth body with this name */
+                            Syntax_Node *subp_body = NULL;
+                            uint32_t body_homograph_idx = 0;
+                            for (uint32_t j = 0; j < generic_body->package_body.declarations.count; j++) {
+                                Syntax_Node *decl = generic_body->package_body.declarations.items[j];
+                                if (!decl) continue;
+                                if (decl->kind == NK_PROCEDURE_BODY || decl->kind == NK_FUNCTION_BODY) {
+                                    if (Slice_Equal_Ignore_Case(decl->subprogram_body.specification->subprogram_spec.name, exp->name)) {
+                                        if (body_homograph_idx == homograph_idx) {
+                                            subp_body = decl;
+                                            break;
+                                        }
+                                        body_homograph_idx++;
+                                    }
+                                }
+                            }
+                            if (subp_body) {
+                                Generate_Generic_Instance_Body(cg, exp, subp_body);
+                            }
+                        }
+                    }
                 } else {
                     Generate_Generic_Instance_Body(cg, inst_sym, generic_body);
                 }
@@ -14798,6 +14974,10 @@ static void Generate_Extern_Declarations(Code_Generator *cg, Syntax_Node *node) 
             if (!pkg_sym || pkg_sym->kind != SYMBOL_PACKAGE) continue;
             if (!pkg_sym->declaration) continue;
 
+            /* Skip extern declarations for packages whose bodies will be code-generated.
+             * Those symbols will be defined, not external. */
+            if (Body_Already_Loaded(pkg_sym->name)) continue;
+
             Syntax_Node *pkg_decl = pkg_sym->declaration;
             if (pkg_decl->kind != NK_PACKAGE_SPEC) continue;
 
@@ -14963,11 +15143,11 @@ static void Generate_Compilation_Unit(Code_Generator *cg, Syntax_Node *node) {
 
     /* Standard exceptions (RM 11.1) */
     Emit(cg, "; Standard exception identities\n");
-    Emit(cg, "@.ex.CONSTRAINT_ERROR = linkonce_odr constant i64 1\n");
-    Emit(cg, "@.ex.NUMERIC_ERROR = linkonce_odr constant i64 2\n");
-    Emit(cg, "@.ex.PROGRAM_ERROR = linkonce_odr constant i64 3\n");
-    Emit(cg, "@.ex.STORAGE_ERROR = linkonce_odr constant i64 4\n");
-    Emit(cg, "@.ex.TASKING_ERROR = linkonce_odr constant i64 5\n\n");
+    Emit(cg, "@__exc.CONSTRAINT_ERROR = linkonce_odr constant i64 1\n");
+    Emit(cg, "@__exc.NUMERIC_ERROR = linkonce_odr constant i64 2\n");
+    Emit(cg, "@__exc.PROGRAM_ERROR = linkonce_odr constant i64 3\n");
+    Emit(cg, "@__exc.STORAGE_ERROR = linkonce_odr constant i64 4\n");
+    Emit(cg, "@__exc.TASKING_ERROR = linkonce_odr constant i64 5\n\n");
 
     /* Secondary stack initialization */
     Emit(cg, "; Secondary stack runtime\n");
@@ -15455,6 +15635,30 @@ static void Generate_Compilation_Unit(Code_Generator *cg, Syntax_Node *node) {
 static const char *Include_Paths[32];
 static int Include_Path_Count = 0;
 
+/* Track loaded package bodies for code generation */
+static Syntax_Node *Loaded_Package_Bodies[128];
+static int Loaded_Body_Count = 0;
+
+/* Track which package bodies have already been loaded (to avoid duplicates) */
+static String_Slice Loaded_Body_Names[128];
+static int Loaded_Body_Names_Count = 0;
+
+static bool Body_Already_Loaded(String_Slice name) {
+    for (int i = 0; i < Loaded_Body_Names_Count; i++) {
+        if (Loaded_Body_Names[i].length == name.length &&
+            strncasecmp(Loaded_Body_Names[i].data, name.data, name.length) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void Mark_Body_Loaded(String_Slice name) {
+    if (Loaded_Body_Names_Count < 128) {
+        Loaded_Body_Names[Loaded_Body_Names_Count++] = name;
+    }
+}
+
 /* Track packages currently being loaded to detect cycles */
 typedef struct {
     String_Slice names[64];
@@ -15528,6 +15732,49 @@ static char *Lookup_Path(String_Slice name) {
 
         /* Try .ads extension */
         snprintf(full_path, sizeof(full_path), "%s.ads", path);
+        char *src = Read_File_Simple(full_path);
+        if (src) return src;
+    }
+    return NULL;
+}
+
+/* Check if a precompiled .ll file exists for a package in include paths */
+static bool Has_Precompiled_LL(String_Slice name) {
+    char path[512], full_path[520];
+    for (int i = 0; i < Include_Path_Count; i++) {
+        size_t base_len = strlen(Include_Paths[i]);
+        snprintf(path, sizeof(path), "%s%s%.*s",
+                 Include_Paths[i],
+                 (base_len > 0 && Include_Paths[i][base_len-1] != '/') ? "/" : "",
+                 (int)name.length, name.data);
+        for (char *p = path + base_len; *p; p++) {
+            if (*p >= 'A' && *p <= 'Z') *p = *p - 'A' + 'a';
+        }
+        snprintf(full_path, sizeof(full_path), "%s.ll", path);
+        FILE *f = fopen(full_path, "r");
+        if (f) { fclose(f); return true; }
+    }
+    return false;
+}
+
+/* Find a package body source file in include paths */
+static char *Lookup_Path_Body(String_Slice name) {
+    char path[512], full_path[520];
+
+    for (int i = 0; i < Include_Path_Count; i++) {
+        size_t base_len = strlen(Include_Paths[i]);
+        snprintf(path, sizeof(path), "%s%s%.*s",
+                 Include_Paths[i],
+                 (base_len > 0 && Include_Paths[i][base_len-1] != '/') ? "/" : "",
+                 (int)name.length, name.data);
+
+        /* Lowercase the filename part */
+        for (char *p = path + base_len; *p; p++) {
+            if (*p >= 'A' && *p <= 'Z') *p = *p - 'A' + 'a';
+        }
+
+        /* Try .adb extension */
+        snprintf(full_path, sizeof(full_path), "%s.adb", path);
         char *src = Read_File_Simple(full_path);
         if (src) return src;
     }
@@ -15645,6 +15892,106 @@ static void Load_Package_Spec(Symbol_Manager *sm, String_Slice name, char *src) 
 
     /* Done loading this package */
     Loading_Set_Remove(name);
+
+    /* Also try to load the package body if available.
+     * Skip if a precompiled .ll file exists (package provided externally). */
+    if (Body_Already_Loaded(name)) {
+        return;  /* Body already loaded */
+    }
+    if (Has_Precompiled_LL(name)) {
+        return;  /* Precompiled version will be linked in */
+    }
+    char *body_src = Lookup_Path_Body(name);
+    if (body_src && Loaded_Body_Count < 128) {
+        Mark_Body_Loaded(name);
+        /* Parse the body */
+        char body_filename[256];
+        snprintf(body_filename, sizeof(body_filename), "%.*s.adb", (int)name.length, name.data);
+        Parser body_parser = Parser_New(body_src, strlen(body_src), body_filename);
+        Syntax_Node *body_cu = Parse_Compilation_Unit(&body_parser);
+
+        if (body_cu && body_cu->compilation_unit.unit) {
+            Syntax_Node *body_unit = body_cu->compilation_unit.unit;
+
+            /* Recursively load WITH'd packages from body */
+            if (body_cu->compilation_unit.context) {
+                Node_List *withs = &body_cu->compilation_unit.context->context.with_clauses;
+                for (uint32_t i = 0; i < withs->count; i++) {
+                    Syntax_Node *with_node = withs->items[i];
+                    for (uint32_t j = 0; j < with_node->use_clause.names.count; j++) {
+                        Syntax_Node *pkg_name = with_node->use_clause.names.items[j];
+                        if (pkg_name->kind == NK_IDENTIFIER) {
+                            char *pkg_src = Lookup_Path(pkg_name->string_val.text);
+                            if (pkg_src) {
+                                Load_Package_Spec(sm, pkg_name->string_val.text, pkg_src);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (body_unit->kind == NK_PACKAGE_BODY) {
+                /* Look up the package symbol */
+                String_Slice body_name = body_unit->package_body.name;
+                Symbol *pkg_sym = Symbol_Find(sm, body_name);
+
+                if (pkg_sym && pkg_sym->kind == SYMBOL_PACKAGE) {
+                    /* Link body to spec */
+                    body_unit->symbol = pkg_sym;
+
+                    /* Resolve the body within package scope */
+                    Symbol_Manager_Push_Scope(sm, pkg_sym);
+
+                    /* Install visible and private declarations from package spec
+                     * into the body's scope (RM 7.1, 7.2) */
+                    Syntax_Node *spec = pkg_sym->declaration;
+                    if (spec && spec->kind == NK_PACKAGE_SPEC) {
+                        /* Helper: install symbols from a declaration */
+                        #define INSTALL_DECL_SYMBOLS(decl) do { \
+                            if ((decl)->symbol) Symbol_Add(sm, (decl)->symbol); \
+                            if ((decl)->kind == NK_OBJECT_DECL) { \
+                                for (uint32_t k = 0; k < (decl)->object_decl.names.count; k++) { \
+                                    Syntax_Node *n = (decl)->object_decl.names.items[k]; \
+                                    if (n->symbol) Symbol_Add(sm, n->symbol); \
+                                } \
+                            } \
+                            if ((decl)->kind == NK_EXCEPTION_DECL) { \
+                                for (uint32_t k = 0; k < (decl)->exception_decl.names.count; k++) { \
+                                    Syntax_Node *n = (decl)->exception_decl.names.items[k]; \
+                                    if (n->symbol) Symbol_Add(sm, n->symbol); \
+                                } \
+                            } \
+                            if ((decl)->kind == NK_TYPE_DECL && (decl)->type_decl.definition && \
+                                (decl)->type_decl.definition->kind == NK_ENUMERATION_TYPE) { \
+                                Node_List *lits = &(decl)->type_decl.definition->enum_type.literals; \
+                                for (uint32_t k = 0; k < lits->count; k++) { \
+                                    if (lits->items[k]->symbol) Symbol_Add(sm, lits->items[k]->symbol); \
+                                } \
+                            } \
+                        } while(0)
+
+                        /* Install visible declarations */
+                        for (uint32_t i = 0; i < spec->package_spec.visible_decls.count; i++) {
+                            Syntax_Node *decl = spec->package_spec.visible_decls.items[i];
+                            INSTALL_DECL_SYMBOLS(decl);
+                        }
+                        /* Install private declarations */
+                        for (uint32_t i = 0; i < spec->package_spec.private_decls.count; i++) {
+                            Syntax_Node *decl = spec->package_spec.private_decls.items[i];
+                            INSTALL_DECL_SYMBOLS(decl);
+                        }
+                        #undef INSTALL_DECL_SYMBOLS
+                    }
+
+                    Resolve_Declaration_List(sm, &body_unit->package_body.declarations);
+                    Symbol_Manager_Pop_Scope(sm);
+
+                    /* Store for code generation */
+                    Loaded_Package_Bodies[Loaded_Body_Count++] = body_cu;
+                }
+            }
+        }
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -15674,6 +16021,10 @@ static char *Read_File(const char *path, size_t *out_size) {
 }
 
 static void Compile_File(const char *input_path, const char *output_path) {
+    /* Reset loaded bodies for this compilation */
+    Loaded_Body_Count = 0;
+    Loaded_Body_Names_Count = 0;
+
     size_t source_size;
     char *source = Read_File(input_path, &source_size);
 
@@ -15728,6 +16079,11 @@ static void Compile_File(const char *input_path, const char *output_path) {
     Code_Generator *cg = Code_Generator_New(out_file, sm);
     for (int i = 0; i < unit_count; i++) {
         Generate_Compilation_Unit(cg, units[i]);
+    }
+
+    /* Generate code for loaded package bodies (e.g., TEXT_IO) */
+    for (int i = 0; i < Loaded_Body_Count; i++) {
+        Generate_Compilation_Unit(cg, Loaded_Package_Bodies[i]);
     }
 
     /* Emit @main() for the last parameterless library-level procedure */
