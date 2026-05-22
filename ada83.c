@@ -2013,6 +2013,15 @@ typedef struct {
   uint32_t     disc_cache [MAX_DISC_CACHE];     // Cached discriminant value temps
   uint32_t     disc_cache_count;                // Number of entries in the disc cache
   Type_Info   *disc_cache_type;                 // Record type the disc cache belongs to
+
+  // §13.1 Emit debug-location instrumentation. When `emit_debug_locations`
+  // is true, each emitted IR line gets a trailing `; @ FUNC:LINE` comment
+  // identifying the C source site that started the line. Toggled by `-g`.
+  bool         emit_debug_locations;
+  bool         emit_at_line_start;              // true if next Emit begins a fresh IR line
+  bool         emit_line_has_content;           // any non-whitespace written since last '\n'
+  const char  *emit_line_start_func;            // captured __func__ when line started
+  int          emit_line_start_line;            // captured __LINE__ when line started
 } Code_Generator;
 
 // Global code generator state
@@ -2048,7 +2057,10 @@ void        Temp_Mark_Fat_Alloca  (uint32_t temp_id);
 bool        Temp_Is_Fat_Alloca    (uint32_t temp_id);
 
 // Write a formatted line of LLVM IR text to the output stream (like fprintf to cg->output).
-void Emit                   (const char *format, ...);
+// The public `Emit (...)` macro forwards `__func__`/`__LINE__` from the call site
+// so that, with `-g`, each IR line carries a trailing `; @ FUNC:LINE` comment.
+void Emit_Impl              (const char *src_func, int src_line, const char *format, ...);
+#define Emit(...) Emit_Impl (__func__, __LINE__, __VA_ARGS__)
 // Emit an LLVM debug-location comment anchoring the next instruction to source.
 void Emit_Location          (Source_Location location);
 // Emit a basic-block label, closing the previous block if it has no terminator.
@@ -3014,6 +3026,7 @@ typedef struct {
 
 extern Loading_Set   Loading_Packages;
 extern const char   *Include_Paths[32];
+extern bool          Debug_Emit_Locations;
 extern uint32_t      Include_Path_Count;
 extern Syntax_Node  *Loaded_Package_Bodies[128];
 extern int           Loaded_Body_Count;
@@ -15593,6 +15606,11 @@ void Code_Generator_Init (FILE *output) {
   cg->string_const_capacity = 4096;
   cg->string_const_buffer   = Arena_Allocate (cg->string_const_capacity);
   cg->string_const_size     = 0;
+  cg->emit_debug_locations  = Debug_Emit_Locations;
+  cg->emit_at_line_start    = true;
+  cg->emit_line_has_content = false;
+  cg->emit_line_start_func  = NULL;
+  cg->emit_line_start_line  = 0;
 }
 
 // Record the actual LLVM type for a generated temp register
@@ -15701,12 +15719,92 @@ uint32_t Emit_Temp (void) {
 uint32_t Emit_Label (void) {
   return cg->label_id++;
 }
-void Emit (const char *format, ...) {
+// Emit IR text. When `cg->emit_debug_locations` is true, append a trailing
+// `; @ FUNC:LINE` comment to every emitted line, attributed to whichever C
+// site *started* the line (subsequent fragments contributing to the same
+// line do not overwrite the attribution). Embedded newlines in a single
+// format string are all attributed to the same captured site, which is what
+// we want for multi-line block emissions.
+//
+// Note: Emit is the macro defined alongside the forward decl; callers stay
+// `Emit (...)` unchanged. The macro injects __func__ / __LINE__.
+#undef Emit
+void Emit_Impl (const char *src_func, int src_line, const char *format, ...) {
+  // Capture the originating site when we are at the start of a fresh line.
+  if (cg->emit_at_line_start) {
+    cg->emit_line_start_func = src_func;
+    cg->emit_line_start_line = src_line;
+  }
+
   va_list args;
   va_start (args, format);
-  vfprintf (cg->output, format, args);
+
+  if (not cg->emit_debug_locations) {
+    vfprintf (cg->output, format, args);
+    va_end (args);
+    size_t n = strlen (format);
+    if (n > 0) cg->emit_at_line_start = (format[n - 1] == '\n');
+    return;
+  }
+
+  // Debug mode: format into a buffer so we can scan for `\n` and inject the
+  // trailing site-comment before each one. Use a stack buffer for the common
+  // case and fall back to the heap for the rare long line.
+  char  stack_buf [4096];
+  char *buf  = stack_buf;
+  int   need;
+  va_list args_copy;
+  va_copy (args_copy, args);
+  need = vsnprintf (stack_buf, sizeof (stack_buf), format, args_copy);
+  va_end (args_copy);
+  if (need >= (int) sizeof (stack_buf)) {
+    buf  = malloc ((size_t) need + 1);
+    need = vsnprintf (buf, (size_t) need + 1, format, args);
+  }
   va_end (args);
+  if (need < 0) return;
+
+  // Walk the buffer; on each '\n', inject `  ; @ FUNC:LINE` before the newline.
+  // Annotate iff the current IR line had any non-whitespace content (tracked
+  // across calls via `emit_line_has_content`) — this skips pure paragraph-break
+  // blank lines while still annotating lines built by multiple Emit calls
+  // (e.g. `Emit("  store ...")` + `Emit_Symbol_Name(sym)` + `Emit("\n")`).
+  const char *p   = buf;
+  const char *end = buf + need;
+  while (p < end) {
+    const char *nl = memchr (p, '\n', (size_t) (end - p));
+    const char *chunk_end = nl ? nl : end;
+
+    // Update the line-content tracker over the chunk we are about to write.
+    for (const char *q = p; q < chunk_end; q++) {
+      if (*q != ' ' and *q != '\t') { cg->emit_line_has_content = true; break; }
+    }
+    fwrite (p, 1, (size_t) (chunk_end - p), cg->output);
+
+    if (not nl) {
+      cg->emit_at_line_start = false;
+      break;
+    }
+
+    if (cg->emit_line_has_content) {
+      fprintf (cg->output, "  ; @ %s:%d",
+               cg->emit_line_start_func ? cg->emit_line_start_func : "?",
+               cg->emit_line_start_line);
+    }
+    fputc ('\n', cg->output);
+
+    // Next IR line starts. Re-capture from this call so multi-line emissions
+    // attribute internal lines to whichever Emit_Impl invocation wrote them.
+    cg->emit_at_line_start    = true;
+    cg->emit_line_has_content = false;
+    cg->emit_line_start_func  = src_func;
+    cg->emit_line_start_line  = src_line;
+    p = nl + 1;
+  }
+
+  if (buf != stack_buf) free (buf);
 }
+#define Emit(...) Emit_Impl (__func__, __LINE__, __VA_ARGS__)
 
 // Emit a source location comment for debugging: ; [filename:line:col]
 void Emit_Location (Source_Location location) {
@@ -40775,6 +40873,10 @@ char *Lookup_Path_Body (String_Slice name) {
 const char     *Include_Paths[32];
 uint32_t        Include_Path_Count        = 0;
 
+// Set by `-g` on the command line. Propagated into `cg` at Code_Generator_Init
+// time so every emitted IR line gets a trailing `; @ FUNC:LINE` comment.
+bool            Debug_Emit_Locations      = false;
+
 // Track loaded package bodies for code generation
 Syntax_Node    *Loaded_Package_Bodies[128];
 int             Loaded_Body_Count          = 0;
@@ -42449,7 +42551,10 @@ void *Compile_Worker (void *arg) {
 int main (int argc, char *argv[]) {
   if (argc < 2) {
     fprintf (stderr,
-      "Usage: %s [-I path] <input.ada ...> [-o output.ll]\n", argv[0]);
+      "Usage: %s [-I path] [-g] <input.ada ...> [-o output.ll]\n"
+      "  -g    Annotate each emitted IR line with `; @ FUNC:LINE` of the\n"
+      "        C source site in ada83.c that produced it (codegen debug).\n",
+      argv[0]);
     return 1;
   }
   const char *inputs[256];
@@ -42466,6 +42571,8 @@ int main (int argc, char *argv[]) {
         Include_Paths[Include_Path_Count++] = argv[i] + 2;
     } else if (strcmp (argv[i], "-o") == 0 and i + 1 < argc) {
       output = argv[++i];
+    } else if (strcmp (argv[i], "-g") == 0) {
+      Debug_Emit_Locations = true;
     } else if (argv[i][0] != '-') {
       if (input_count < 256)
         inputs[input_count++] = argv[i];
