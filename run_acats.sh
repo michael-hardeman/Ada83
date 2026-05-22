@@ -89,7 +89,7 @@ run_one(){
             # Count error coverage
             local -a expected=() actual=(); local i=0 hits=0
             while IFS= read -r l; do ((++i)); [[ $l =~ --\ ERROR ]] && expected+=($i); done < "$f"
-            while IFS=: read -r _ m _; do actual+=($m); done < <(./ada83 "$f" 2>&1|grep "^[^:]*:[0-9]")
+            while IFS=: read -r _ m _; do actual+=($m); done < <(timeout 0.5 ./ada83 "$f" 2>&1|grep "^[^:]*:[0-9]")
             for e in ${expected[@]+"${expected[@]}"}; do
                 for v in ${actual[@]+"${actual[@]}"}; do
                     ((v>=e-1&&v<=e+1)) && { ((++hits)); break; }
@@ -148,6 +148,23 @@ run_one(){
 export -f run_one pct
 export START_MS
 
+# ── Per-test 1-second cap (defense in depth) ──────────────────────────────
+# Wraps run_one in `timeout 1`; on SIGTERM/SIGKILL exit (124/137), emit a
+# synthetic fail line so the test is recorded rather than silently dropped.
+run_one_timed(){
+    local f=$1 n=$(basename "$1" .ada) q
+    q=${f##*/}; q=${q:0:1}; q=${q,,}
+    local out rc=0
+    out=$(timeout 1 bash -c 'run_one "$1"' _ "$f" 2>/dev/null) || rc=$?
+    if ((rc==124 || rc==137)); then
+        echo "$q fail $n TIMEOUT:exceeded_1s"
+    elif [[ -n $out ]]; then
+        echo "$out"
+    fi
+    # empty + rc=0 → legitimate silent skip (foundation file or multi-file fragment)
+}
+export -f run_one_timed
+
 # ── Result aggregation ────────────────────────────────────────────────────
 
 tally_results(){
@@ -203,7 +220,7 @@ run_parallel(){
     # Run tests in parallel, each outputting one result line
     for f in $pattern; do
         [[ -f $f ]] && echo "$f"
-    done | xargs -P "$NPROC" -I{} bash -c 'run_one "$@"' _ {} > "$tmpfile" 2>/dev/null
+    done | xargs -P "$NPROC" -I{} bash -c 'run_one_timed "$@"' _ {} > "$tmpfile" 2>/dev/null
 
     # Sort results by name for stable output, then tally
     sort -k3 "$tmpfile" > "${tmpfile}.sorted"
