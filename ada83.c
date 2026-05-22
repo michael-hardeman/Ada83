@@ -16114,6 +16114,22 @@ void Emit_Symbol_Ref (Symbol *sym) {
   Emit_Symbol_Name (sym);
 }
 
+// Emit a `@__exc.<mangled> = private constant [N x i8] c"NAME\00"` definition.
+// The contents are the upper-cased printable name, used by the unhandled-
+// exception diagnostic in `__ada_raise`. Linkage is `private` because we
+// emit this per compilation unit; address comparisons across units for the
+// same exception currently rely on `linkonce_odr` (standards), and that
+// asymmetry is a pre-existing design choice we don't touch here.
+void Emit_Exception_Identity_Global (const char *mangled) {
+  char upper[256];
+  size_t bl = strlen (mangled);
+  if (bl >= sizeof (upper)) bl = sizeof (upper) - 1;
+  for (size_t k = 0; k < bl; k++) upper[k] = (char) toupper ((unsigned char) mangled[k]);
+  upper[bl] = '\0';
+  Emit ("@__exc.%s = private constant [%zu x i8] c\"%s\\00\"\n",
+        mangled, bl + 1, upper);
+}
+
 // Emit @__exc.<name> reference for an exception symbol and track the name
 // so Generate_Exception_Globals can emit matching definitions.
 void Emit_Exception_Ref (Symbol *exc) {
@@ -37619,7 +37635,7 @@ void Generate_Exception_Globals (void) {
         exc_emitted[exc_emitted_count][255] = '\0';
         exc_emitted_count++;
       }
-      Emit ("@__exc.%s = private constant i8 0\n", buf);
+      Emit_Exception_Identity_Global (buf);
     }
     Emit ("\n");
   }
@@ -37676,7 +37692,7 @@ void Generate_Exception_Globals (void) {
         }
       }
       if (not already) {
-        Emit ("@__exc.%s = private constant i8 0\n", name);
+        Emit_Exception_Identity_Global (name);
       }
     }
   }
@@ -38386,15 +38402,26 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   Emit ("@__ex_cur = linkonce_odr global i64 0\n");
   Emit ("@__fin_list = linkonce_odr global ptr null\n");
   Emit ("@__entry_queue = linkonce_odr global ptr null\n");
-  Emit ("@.fmt_ue = linkonce_odr constant [27 x i8] c\"Unhandled exception: %%lld\\0A\\00\"\n\n");
+  // Format string for unhandled-exception diagnostic. Exceptions are
+  // identified at runtime by the *address* of their `@__exc.<name>` global,
+  // and we store the printable upper-case name as the *contents* of that
+  // global. The unhandled handler inttoptr's the exception id and prints
+  // it as a C string, so the message reads e.g.
+  //     Unhandled exception: CONSTRAINT_ERROR
+  // instead of the bare integer address. Address-based comparisons in
+  // handler dispatch (Generate_Exception_Dispatch) are unaffected.
+  Emit ("@.fmt_ue = linkonce_odr constant [25 x i8] c\"Unhandled exception: %%s\\0A\\00\"\n\n");
 
-  // Standard exceptions (RM 11.1) - names lowercase to match mangled symbols
+  // Standard exceptions (RM 11.1). Symbol names are lowercase to match the
+  // mangled call-site `@__exc.<name>`; the *contents* of each global are
+  // the upper-case display name (null-terminated) used by the unhandled
+  // diagnostic above.
   Emit ("; Standard exception identities\n");
-  Emit ("@__exc.constraint_error = linkonce_odr constant i64 1\n");
-  Emit ("@__exc.numeric_error = linkonce_odr constant i64 2\n");
-  Emit ("@__exc.program_error = linkonce_odr constant i64 3\n");
-  Emit ("@__exc.storage_error = linkonce_odr constant i64 4\n");
-  Emit ("@__exc.tasking_error = linkonce_odr constant i64 5\n\n");
+  Emit ("@__exc.constraint_error = linkonce_odr constant [17 x i8] c\"CONSTRAINT_ERROR\\00\"\n");
+  Emit ("@__exc.numeric_error    = linkonce_odr constant [14 x i8] c\"NUMERIC_ERROR\\00\"\n");
+  Emit ("@__exc.program_error    = linkonce_odr constant [14 x i8] c\"PROGRAM_ERROR\\00\"\n");
+  Emit ("@__exc.storage_error    = linkonce_odr constant [14 x i8] c\"STORAGE_ERROR\\00\"\n");
+  Emit ("@__exc.tasking_error    = linkonce_odr constant [14 x i8] c\"TASKING_ERROR\\00\"\n\n");
 
   // Secondary stack initialization
   Emit ("; Secondary stack runtime\n");
@@ -38489,7 +38516,11 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   Emit ("  call void @longjmp(ptr %%jb, i32 1)\n");
   Emit ("  unreachable\n");
   Emit ("unhandled:\n");
-  Emit ("  call i32 (ptr, ...) @printf (ptr @.fmt_ue, i64 %%exc_id)\n");
+  // The exception id is the i64 address of `@__exc.<name>`, whose contents
+  // are the printable name (null-terminated). inttoptr back to a string ptr
+  // so printf("%s") gets the readable form.
+  Emit ("  %%exc_name = inttoptr i64 %%exc_id to ptr\n");
+  Emit ("  call i32 (ptr, ...) @printf (ptr @.fmt_ue, ptr %%exc_name)\n");
   Emit ("  call void @exit (i32 1)\n");
   Emit ("  unreachable\n");
   Emit ("}\n\n");
@@ -42591,7 +42622,7 @@ void Compile_File (const char *input_path, const char *output_path) {
         }
       }
       if (not already) {
-        Emit ("@__exc.%s = private constant i8 0\n", name);
+        Emit_Exception_Identity_Global (name);
       }
     }
   }
