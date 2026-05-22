@@ -2171,6 +2171,13 @@ int      Nested_Frame_Depth             (Symbol *proc);
 uint32_t Precompute_Nested_Frame_Arg    (Symbol *proc);
 // Emit the static-chain argument in a call instruction; return true if one was emitted.
 bool     Emit_Nested_Frame_Arg          (Symbol *proc, uint32_t precomp);
+// Follow the rename chain for subprogram renamings (RM 8.5). Returns the
+// underlying body. Call this on a callable symbol before emitting `@name`
+// or checking static-chain nesting; renames do not generate their own body.
+Symbol  *Resolve_Subprogram_Rename      (Symbol *sym);
+// Map an operator's source-text name (e.g. "+", "<=", "mod") to its Token_Kind.
+// Returns TK_EOF if the name isn't an operator.
+Token_Kind Token_From_Op_Name           (String_Slice name);
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════════
 //
@@ -2423,6 +2430,8 @@ uint32_t Generate_Real_Literal      (Syntax_Node *node);
 uint32_t Generate_String_Literal    (Syntax_Node *node);
 uint32_t Generate_Identifier        (Syntax_Node *node);
 uint32_t Generate_Binary_Op         (Syntax_Node *node);
+// Predefined binary-operator emitter; see definition for the operators it owns.
+uint32_t Emit_Binary_Op_Predefined  (Syntax_Node *node);
 uint32_t Generate_Unary_Op          (Syntax_Node *node);
 uint32_t Generate_Apply             (Syntax_Node *node);
 uint32_t Generate_Selected          (Syntax_Node *node);
@@ -16165,6 +16174,64 @@ bool Subprogram_Needs_Static_Chain (Symbol *sym) {
   return Find_Enclosing_Subprogram (sym) != NULL;
 }
 
+// Follow the rename chain for subprogram renamings.
+//
+// A renaming declaration (RM 8.5) — e.g. `FUNCTION "+" RENAMES "*"` — does
+// not generate its own body. Calls to the rename must dispatch to the
+// renamed entity. Code-generation paths that emit `@name` for a call, or
+// query `Subprogram_Needs_Static_Chain` on the callee, must peel through
+// the chain first; otherwise they emit a call to a never-defined function
+// and (if the rename appeared inside another subprogram) pass `%__frame_base`
+// from a function that never allocated one.
+//
+// The chain may be deeper than one link: renaming a rename is legal.
+//
+// For object renames (`X : T RENAMES Y`) the `renamed_object` field stores
+// a `Syntax_Node*` (the renamed expression) — NOT a Symbol — and is peeled
+// elsewhere in lvalue/identifier generation. We detect subprogram renames
+// by the symbol kind, which is set when the rename declaration is processed.
+//
+Symbol *Resolve_Subprogram_Rename (Symbol *sym) {
+  while (sym and sym->renamed_object and
+       (sym->kind == SYMBOL_FUNCTION or sym->kind == SYMBOL_PROCEDURE)) {
+    Symbol *target = (Symbol *) sym->renamed_object;
+    if (target->kind != SYMBOL_FUNCTION and target->kind != SYMBOL_PROCEDURE)
+      break;
+    sym = target;
+  }
+  return sym;
+}
+
+// Map an Ada operator's source-text name to its Token_Kind. Returns TK_EOF
+// for names that are not operators (used as a sentinel). The translation is
+// needed when a subprogram rename peels to a predefined operator whose name
+// differs from the source expression's op token — e.g. `FUNCTION "+" RENAMES "*"`
+// turns `a + b` into `a * b`. The emitter dispatches by Token_Kind, so we
+// re-express the rename's name as the matching token.
+//
+Token_Kind Token_From_Op_Name (String_Slice name) {
+  if (Slice_Equal_Ignore_Case (name, S("+")))   return TK_PLUS;
+  if (Slice_Equal_Ignore_Case (name, S("-")))   return TK_MINUS;
+  if (Slice_Equal_Ignore_Case (name, S("*")))   return TK_STAR;
+  if (Slice_Equal_Ignore_Case (name, S("/")))   return TK_SLASH;
+  if (Slice_Equal_Ignore_Case (name, S("**")))  return TK_EXPON;
+  if (Slice_Equal_Ignore_Case (name, S("&")))   return TK_AMPERSAND;
+  if (Slice_Equal_Ignore_Case (name, S("=")))   return TK_EQ;
+  if (Slice_Equal_Ignore_Case (name, S("/=")))  return TK_NE;
+  if (Slice_Equal_Ignore_Case (name, S("<")))   return TK_LT;
+  if (Slice_Equal_Ignore_Case (name, S("<=")))  return TK_LE;
+  if (Slice_Equal_Ignore_Case (name, S(">")))   return TK_GT;
+  if (Slice_Equal_Ignore_Case (name, S(">=")))  return TK_GE;
+  if (Slice_Equal_Ignore_Case (name, S("and"))) return TK_AND;
+  if (Slice_Equal_Ignore_Case (name, S("or")))  return TK_OR;
+  if (Slice_Equal_Ignore_Case (name, S("xor"))) return TK_XOR;
+  if (Slice_Equal_Ignore_Case (name, S("mod"))) return TK_MOD;
+  if (Slice_Equal_Ignore_Case (name, S("rem"))) return TK_REM;
+  if (Slice_Equal_Ignore_Case (name, S("abs"))) return TK_ABS;
+  if (Slice_Equal_Ignore_Case (name, S("not"))) return TK_NOT;
+  return TK_EOF;
+}
+
 // Is sym an uplevel reference requiring access through __parent_frame?
 bool Is_Uplevel_Access (const Symbol *sym) {
   if (not cg->current_function or not sym) return false;
@@ -19739,39 +19806,79 @@ uint32_t Convert_Real_To_Fixed (uint32_t val, double small, const char *fix_type
   Temp_Set_Type (scaled, fix_type);
   return scaled;
 }
+// Generate_Binary_Op — dispatch a binary operator node to either a user-defined
+// function call (RM 6.7) or, after rename peeling (RM 8.5), the predefined-op
+// emitter `Emit_Binary_Op_Predefined`. The latter owns all the per-op semantics
+// (overflow checks, slice/fat-pointer comparison, AND_THEN/OR_ELSE, `&` concat,
+// membership, fixed-point, float, universal int128, scalar arith/cmp).
+//
+// Stage 1 of dedup: extracted the predefined body into its own function so a
+// future stage can route `P."+"(X,Y)`-style calls in Generate_Apply through it
+// instead of maintaining a parallel ~200-line name-dispatcher.
+//
 uint32_t Generate_Binary_Op (Syntax_Node *node) {
 
+  // Peel through any subprogram rename chain (RM 8.5). A rename does not emit
+  // its own body — calls dispatch to the renamed entity.
+  Symbol *call_target = Resolve_Subprogram_Rename (node->symbol);
+
   // User-defined operator: generate function call (RM 6.7)
-  if (node->symbol and node->symbol->kind == SYMBOL_FUNCTION and
-    not node->symbol->is_predefined) {
+  if (call_target and call_target->kind == SYMBOL_FUNCTION and
+    not call_target->is_predefined) {
     uint32_t    left       = Generate_Expression  (node->binary.left);
     uint32_t    right      = Generate_Expression  (node->binary.right);
     const char *left_llvm  = Expression_Llvm_Type (node->binary.left);
     const char *right_llvm = Expression_Llvm_Type (node->binary.right);
-    Type_Info *p0_type = (node->symbol->parameter_count > 0) ?
-      node->symbol->parameters[0].param_type : NULL;
-    Type_Info *p1_type = (node->symbol->parameter_count > 1) ?
-      node->symbol->parameters[1].param_type : NULL;
+    Type_Info *p0_type = (call_target->parameter_count > 0) ?
+      call_target->parameters[0].param_type : NULL;
+    Type_Info *p1_type = (call_target->parameter_count > 1) ?
+      call_target->parameters[1].param_type : NULL;
     const char *p0_llvm = p0_type ? Type_To_Llvm (p0_type) : left_llvm;
     const char *p1_llvm = p1_type ? Type_To_Llvm (p1_type) : right_llvm;
     left = Emit_Convert (left, left_llvm, p0_llvm);
     right = Emit_Convert (right, right_llvm, p1_llvm);
-    const char *ret_type = node->symbol->return_type ?
-      Type_To_Llvm (node->symbol->return_type) : "i32";
-    bool callee_is_nested = Subprogram_Needs_Static_Chain (node->symbol);
+    const char *ret_type = call_target->return_type ?
+      Type_To_Llvm (call_target->return_type) : "i32";
+    bool callee_is_nested = Subprogram_Needs_Static_Chain (call_target);
     uint32_t frame_pre = callee_is_nested ?
-      Precompute_Nested_Frame_Arg (node->symbol) : 0;
+      Precompute_Nested_Frame_Arg (call_target) : 0;
     uint32_t result = Emit_Temp ();
     Emit ("  %%t%u = call %s @", result, ret_type);
-    Emit_Symbol_Name (node->symbol);
+    Emit_Symbol_Name (call_target);
     Emit ("(");
     if (callee_is_nested) {
-      Emit_Nested_Frame_Arg (node->symbol, frame_pre);
+      Emit_Nested_Frame_Arg (call_target, frame_pre);
       Emit (", ");
     }
     Emit ("%s %%t%u, %s %%t%u)\n", p0_llvm, left, p1_llvm, right);
     return result;
   }
+
+  // Rename-to-different-predefined: dispatch by the *target's* op token, not
+  // the source's. `FUNCTION "+" RENAMES "*"` must turn `a + b` into multiply.
+  // We shadow `node` with a shallow copy whose op is overridden; the rest of
+  // the AST (operands, type, location) is shared by pointer.
+  if (call_target and call_target != node->symbol and call_target->is_predefined) {
+    Token_Kind override = Token_From_Op_Name (call_target->name);
+    if (override != TK_EOF and override != node->binary.op) {
+      Syntax_Node tmp  = *node;
+      tmp.binary.op    = override;
+      return Emit_Binary_Op_Predefined (&tmp);
+    }
+  }
+
+  return Emit_Binary_Op_Predefined (node);
+}
+
+// Emit_Binary_Op_Predefined — the predefined binary-operator emitter. Handles
+// all built-in operators on Ada's scalar and composite types. Reads `node->
+// binary.{op,left,right}` and `node->type`. Returns the result temp.
+//
+// This is the *only* place these semantics live. Called from Generate_Binary_Op
+// after rename peeling, and (Stage 2) from Generate_Apply when a predefined
+// operator is invoked in functional form (`P."+"(X,Y)`).
+//
+uint32_t Emit_Binary_Op_Predefined (Syntax_Node *node) {
 
   // Check if this is equality/inequality on composite types
   Type_Info *left_type = node->binary.left ? node->binary.left->type : NULL;
@@ -19917,7 +20024,10 @@ uint32_t Generate_Binary_Op (Syntax_Node *node) {
       eq_result = ne_result;
     }
 
-    // Comparisons stay as i1 (Boolean_Data relationship)
+    // Comparisons stay as i1 (Boolean_Data relationship). Record the type
+    // so callers (e.g. Generate_Apply's operator-as-function path) can detect
+    // it and widen to BOOLEAN i8 at the call boundary.
+    Temp_Set_Type (eq_result, "i1");
     return eq_result;
   }
 
@@ -19994,7 +20104,8 @@ uint32_t Generate_Binary_Op (Syntax_Node *node) {
         Emit ("  %%t%u = icmp eq i32 %%t%u, 0\n", cmp_result, memcmp_result);
     }
 
-    // Comparisons stay as i1
+    // Comparisons stay as i1. Record the type so call-form callers can widen.
+    Temp_Set_Type (cmp_result, "i1");
     return cmp_result;
   }
 
@@ -21035,13 +21146,20 @@ uint32_t Generate_Binary_Op (Syntax_Node *node) {
 }
 uint32_t Generate_Unary_Op (Syntax_Node *node) {
 
-  // User-defined unary operator: generate function call (RM 6.7)
-  if (node->symbol and node->symbol->kind == SYMBOL_FUNCTION and
-    not node->symbol->is_predefined) {
+  // Peel through any subprogram rename chain (RM 8.5). If the resolved
+  // target is a predefined operator (`"-" RENAMES "abs"` etc.), fall through
+  // to the inline-operator path below instead of calling a never-emitted body.
+  Symbol *peeled = Resolve_Subprogram_Rename (node->symbol);
 
-    // Resolve through parent_operation for derived operators (RM 3.4)
-    Symbol *call_target = node->symbol->parent_operation ?
-      node->symbol->parent_operation : node->symbol;
+  // User-defined unary operator: generate function call (RM 6.7)
+  if (peeled and peeled->kind == SYMBOL_FUNCTION and
+    not peeled->is_predefined) {
+
+    // Resolve through parent_operation for derived operators (RM 3.4).
+    // parent_operation is orthogonal to renaming; check it on the peeled
+    // target so we land on the actual body to call.
+    Symbol *call_target = peeled->parent_operation ?
+      peeled->parent_operation : peeled;
     uint32_t operand = Generate_Expression (node->unary.operand);
     const char *op_llvm = Expression_Llvm_Type (node->unary.operand);
     Type_Info *p0_type = (call_target->parameter_count > 0) ?
@@ -21213,17 +21331,7 @@ uint32_t Generate_Apply (Syntax_Node *node) {
     Emit (")\n");
   }
 
-  // Follow rename chain to get actual target symbol for code generation.
-  // Renames don't generate their own function body - they call the target.
-  while (sym and sym->renamed_object and
-       (sym->kind == SYMBOL_FUNCTION or sym->kind == SYMBOL_PROCEDURE)) {
-    Symbol *target = (Symbol *)sym->renamed_object;
-    if (target->kind == SYMBOL_FUNCTION or target->kind == SYMBOL_PROCEDURE) {
-      sym = target;
-    } else {
-      break;
-    }
-  }
+  sym = Resolve_Subprogram_Rename (sym);
 
   // Predefined operator called as function: P."="(X,Y) or "NOT"(X) etc.                           
   // These have is_predefined set and no body, or the prefix is an operator                         
@@ -21236,137 +21344,64 @@ uint32_t Generate_Apply (Syntax_Node *node) {
     String_Slice op_name = sym ? sym->name : node->apply.prefix->string_val.text;
     uint32_t argc = (uint32_t)node->apply.arguments.count;
 
-    // Get first argument
+    // Get first argument (unwrap NK_ASSOCIATION). Note: operand evaluation
+    // is *not* done here for the 2-arg path — the predefined-binary helper
+    // does its own Generate_Expression on left/right, so doing it here would
+    // double-evaluate. The 1-arg path below evaluates its single argument
+    // explicitly because there's no shared unary helper yet.
     Syntax_Node *arg0 = node->apply.arguments.items[0];
     if (arg0->kind == NK_ASSOCIATION) arg0 = arg0->association.expression;
-    uint32_t v0 = Generate_Expression (arg0);
-    const char *t0 = Expression_Llvm_Type (arg0);
-    Type_Info *ty0 = arg0->type;
+
     if (argc == 2) {
       Syntax_Node *arg1 = node->apply.arguments.items[1];
       if (arg1->kind == NK_ASSOCIATION) arg1 = arg1->association.expression;
-      uint32_t v1 = Generate_Expression (arg1);
-      const char *t1 = Expression_Llvm_Type (arg1);
 
-      // Composite equality/inequality: dispatch to record/array equality
-      // before scalar widening (RM 4.5.2)
-      if (ty0 and (Type_Is_Record (ty0) or Type_Is_Array_Like (ty0)) and
-        (Slice_Equal_Ignore_Case (op_name, S("=")) or
-         Slice_Equal_Ignore_Case (op_name, S("/=")))) {
-        uint32_t eq_result;
-        if (Type_Is_Record (ty0)) {
-          eq_result = Generate_Record_Equality (v0, v1, ty0);
-        } else {
-          eq_result = Generate_Array_Equality (v0, v1, ty0);
-        }
-        if (Slice_Equal_Ignore_Case (op_name, S("/="))) {
-          uint32_t ne_r = Emit_Temp ();
-          Emit ("  %%t%u = xor i1 %%t%u, 1\n", ne_r, eq_result);
-          eq_result = ne_r;
-        }
+      // Stage 2 of dedup: route operator-as-function calls through the same
+      // predefined-binary emitter that `X op Y` uses. The helper owns all the
+      // semantics — overflow checks, slice/fat-pointer comparisons, type
+      // widening, fixed-point, float, universal int128, scalar arith/cmp.
+      // Previously, this site reimplemented a subset of those semantics,
+      // missing overflow checks and slice handling for `P."+"(X,Y)`-style
+      // calls; now the two paths share one implementation.
+      Token_Kind op = Token_From_Op_Name (op_name);
+      if (op != TK_EOF) {
+        Syntax_Node tmp  = {0};
+        tmp.kind         = NK_BINARY_OP;
+        tmp.binary.op    = op;
+        tmp.binary.left  = arg0;
+        tmp.binary.right = arg1;
+        tmp.type         = sym ? sym->return_type : node->type;
+        tmp.location     = node->location;
+        uint32_t result  = Emit_Binary_Op_Predefined (&tmp);
 
-        // Named operator returns BOOLEAN (i8), not bare i1
-        const char *bool_t = (sym and sym->return_type) ? Type_To_Llvm (sym->return_type) : "i8";
-        if (bool_t[0] == 'i' and bool_t[1] != '1') {
-          uint32_t ext = Emit_Temp ();
-          Emit ("  %%t%u = zext i1 %%t%u to %s\n", ext, eq_result, bool_t);
-          eq_result = ext;
-          Temp_Set_Type (eq_result, bool_t);
-        }
-        return eq_result;
-      }
-
-      // Widen to common type (scalar operands only)
-      const char *ct = Wider_Int_Type (t0, t1);
-      bool uns = Type_Is_Unsigned (ty0);
-      v0 = Emit_Convert_Ext (v0, t0, ct, uns);
-      v1 = Emit_Convert_Ext (v1, t1, ct, uns);
-
-      // Comparison operators
-      int cmp_tk = -1;
-      if (Slice_Equal_Ignore_Case (op_name, S("=")))  cmp_tk = TK_EQ;
-      else if (Slice_Equal_Ignore_Case (op_name, S("/="))) cmp_tk = TK_NE;
-      else if (Slice_Equal_Ignore_Case (op_name, S("<")))  cmp_tk = TK_LT;
-      else if (Slice_Equal_Ignore_Case (op_name, S("<="))) cmp_tk = TK_LE;
-      else if (Slice_Equal_Ignore_Case (op_name, S(">")))  cmp_tk = TK_GT;
-      else if (Slice_Equal_Ignore_Case (op_name, S(">="))) cmp_tk = TK_GE;
-      if (cmp_tk >= 0) {
-        uint32_t result = Emit_Temp ();
-        Emit ("  %%t%u = icmp %s %s %%t%u, %%t%u  ; predef %.*s\n",
-           result, Int_Cmp_Predicate (cmp_tk, uns), ct, v0, v1,
-           (int)op_name.length, op_name.data);
-
-        // Widen i1 > i8 for Ada BOOLEAN
-        uint32_t widened = Emit_Temp ();
-        Emit ("  %%t%u = zext i1 %%t%u to i8\n", widened, result);
-        Temp_Set_Type (widened, "i8");
-        return widened;
-      }
-
-      // Arithmetic operators
-      const char *arith_op = NULL;
-      if (Slice_Equal_Ignore_Case (op_name, S("+")))   arith_op = "add";
-      else if (Slice_Equal_Ignore_Case (op_name, S("-")))   arith_op = "sub";
-      else if (Slice_Equal_Ignore_Case (op_name, S("*")))   arith_op = "mul";
-      else if (Slice_Equal_Ignore_Case (op_name, S("/")))   arith_op = uns ? "udiv" : "sdiv";
-      else if (Slice_Equal_Ignore_Case (op_name, S("mod"))) arith_op = uns ? "urem" : "srem";
-      else if (Slice_Equal_Ignore_Case (op_name, S("rem"))) arith_op = uns ? "urem" : "srem";
-      if (arith_op) {
-        uint32_t result = Emit_Temp ();
-        Emit ("  %%t%u = %s %s %%t%u, %%t%u  ; predef %.*s\n",
-           result, arith_op, ct, v0, v1,
-           (int)op_name.length, op_name.data);
-
-        // Ada MOD correction for named operator
-        if (Slice_Equal_Ignore_Case (op_name, S("mod")) and not uns) {
-          uint32_t nonzero   = Emit_Temp ();
-          Emit ("  %%t%u = icmp ne %s %%t%u, 0\n", nonzero, ct, result);
-          uint32_t sign_xor  = Emit_Temp ();
-          Emit ("  %%t%u = xor %s %%t%u, %%t%u\n", sign_xor, ct, result, v1);
-          uint32_t sign_diff = Emit_Temp ();
-          Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", sign_diff, ct, sign_xor);
-          uint32_t need_fix  = Emit_Temp ();
-          Emit ("  %%t%u = and i1 %%t%u, %%t%u\n", need_fix, nonzero, sign_diff);
-          uint32_t adjusted  = Emit_Temp ();
-          Emit ("  %%t%u = add %s %%t%u, %%t%u\n", adjusted, ct, result, v1);
-          uint32_t corrected = Emit_Temp ();
-          Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u\n",
-             corrected, need_fix, ct, adjusted, ct, result);
-          result = corrected;
+        // The helper returns i1 for comparisons and scalar boolean ops; the
+        // function-call form expects the declared return type (BOOLEAN = i8
+        // in Ada). Widen here so the caller of Generate_Apply sees i8.
+        bool returns_i1 = (op == TK_EQ or op == TK_NE or op == TK_LT or
+                           op == TK_LE or op == TK_GT or op == TK_GE or
+                           op == TK_AND or op == TK_OR or op == TK_XOR);
+        if (returns_i1) {
+          const char *got  = Temp_Get_Type (result);
+          const char *want = (sym and sym->return_type)
+                             ? Type_To_Llvm (sym->return_type) : "i8";
+          if (got and strcmp (got, "i1") == 0 and strcmp (want, "i1") != 0) {
+            uint32_t widened = Emit_Temp ();
+            Emit ("  %%t%u = zext i1 %%t%u to %s\n", widened, result, want);
+            Temp_Set_Type (widened, want);
+            return widened;
+          }
         }
         return result;
       }
 
-      // Exponentiation: "**"(base, exp)
-      if (Slice_Equal_Ignore_Case (op_name, S("**"))) {
-        const char *iat = Integer_Arith_Type ();
-        v0 = Emit_Convert (v0, t0, iat);
-        v1 = Emit_Convert (v1, t1, iat);
-        uint32_t result = Emit_Temp ();
-        Emit ("  %%t%u = call %s @__ada_integer_pow (%s %%t%u, %s %%t%u)\n",
-           result, iat, iat, v0, iat, v1);
-        Temp_Set_Type (result, iat);
-        return result;
-      }
-
-      // Boolean operators
-      if (Slice_Equal_Ignore_Case (op_name, S("and")) or
-        Slice_Equal_Ignore_Case (op_name, S("or")) or
-        Slice_Equal_Ignore_Case (op_name, S("xor"))) {
-        const char *bool_op = Slice_Equal_Ignore_Case (op_name, S("and")) ? "and" :
-                    Slice_Equal_Ignore_Case (op_name, S("or")) ? "or" : "xor";
-        v0 = Emit_Convert (v0, t0, "i1");
-        v1 = Emit_Convert (v1, t1, "i1");
-        uint32_t result = Emit_Temp ();
-        Emit ("  %%t%u = %s i1 %%t%u, %%t%u\n", result, bool_op, v0, v1);
-        uint32_t widened = Emit_Temp ();
-        Emit ("  %%t%u = zext i1 %%t%u to i8\n", widened, result);
-        Temp_Set_Type (widened, "i8");
-        return widened;
-      }
+      // Operator name not recognised; fall through to the regular-call path
+      // below. This shouldn't trigger for standard Ada operators.
 
     // Unary operators: abs, not, unary -
     } else if (argc == 1) {
+      uint32_t    v0  = Generate_Expression  (arg0);
+      const char *t0  = Expression_Llvm_Type (arg0);
+      Type_Info  *ty0 = arg0->type;
 
       // ABS with overflow check: ABS (MIN_INT) overflows
       if (Slice_Equal_Ignore_Case (op_name, S("abs"))) {
@@ -31175,19 +31210,7 @@ void Generate_Statement (Syntax_Node *node) {
       // Parameterless procedure/function call
       } else if (target->kind == NK_IDENTIFIER) {
         Symbol *original_sym = target->symbol;  // Keep for defaults
-        Symbol *proc = original_sym;
-
-        // Follow rename chain to get actual target for function name
-        while (proc and proc->renamed_object and
-             (proc->kind == SYMBOL_FUNCTION or proc->kind == SYMBOL_PROCEDURE)) {
-          Symbol *renamed_target = (Symbol *)proc->renamed_object;
-          if (renamed_target->kind == SYMBOL_FUNCTION or
-            renamed_target->kind == SYMBOL_PROCEDURE) {
-            proc = renamed_target;
-          } else {
-            break;
-          }
-        }
+        Symbol *proc = Resolve_Subprogram_Rename (original_sym);
 
         // Check if calling a nested function (transitively inside another subprogram)
         if (proc and (proc->kind == SYMBOL_PROCEDURE or proc->kind == SYMBOL_FUNCTION)) {
@@ -35229,35 +35252,38 @@ bool Has_Nested_Subprograms (Node_List *declarations, Node_List *statements) {
         return true;
       }
 
-      // Check inside nested package specs for procedure/function declarations
+      // Check inside nested package specs / bodies for any kind of subprogram
+      // that would need access to our frame. Generic instantiations and task
+      // bodies count too: an instantiated generic is a real subprogram whose
+      // `Find_Enclosing_Subprogram` returns *this* function, and codegen will
+      // emit `%__frame_base` at the call site — so the frame must exist here.
       if (decl->kind == NK_PACKAGE_SPEC) {
         Node_List *pkg_visible = &decl->package_spec.visible_decls;
         Node_List *pkg_private = &decl->package_spec.private_decls;
-        for (uint32_t j = 0; j < pkg_visible->count; j++) {
-          Syntax_Node *pd = pkg_visible->items[j];
-          if (pd and (pd->kind == NK_PROCEDURE_SPEC or
-                pd->kind == NK_FUNCTION_SPEC or
-                pd->kind == NK_PROCEDURE_BODY or
-                pd->kind == NK_FUNCTION_BODY))
-            return true;
-        }
-        for (uint32_t j = 0; j < pkg_private->count; j++) {
-          Syntax_Node *pd = pkg_private->items[j];
-          if (pd and (pd->kind == NK_PROCEDURE_SPEC or
-                pd->kind == NK_FUNCTION_SPEC or
-                pd->kind == NK_PROCEDURE_BODY or
-                pd->kind == NK_FUNCTION_BODY))
-            return true;
+        Node_List *parts[2] = { pkg_visible, pkg_private };
+        for (int k = 0; k < 2; k++) {
+          for (uint32_t j = 0; j < parts[k]->count; j++) {
+            Syntax_Node *pd = parts[k]->items[j];
+            if (pd and (pd->kind == NK_PROCEDURE_SPEC or
+                  pd->kind == NK_FUNCTION_SPEC or
+                  pd->kind == NK_PROCEDURE_BODY or
+                  pd->kind == NK_FUNCTION_BODY or
+                  pd->kind == NK_TASK_BODY or
+                  pd->kind == NK_GENERIC_INST))
+              return true;
+          }
         }
       }
 
-      // Check inside nested package bodies for procedure/function bodies
+      // Check inside nested package bodies for any subprogram-shaped decl.
       if (decl->kind == NK_PACKAGE_BODY) {
         Node_List *pkg_decls = &decl->package_body.declarations;
         for (uint32_t j = 0; j < pkg_decls->count; j++) {
           Syntax_Node *pd = pkg_decls->items[j];
           if (pd and (pd->kind == NK_PROCEDURE_BODY or
-                pd->kind == NK_FUNCTION_BODY))
+                pd->kind == NK_FUNCTION_BODY or
+                pd->kind == NK_TASK_BODY or
+                pd->kind == NK_GENERIC_INST))
             return true;
         }
       }
@@ -35740,6 +35766,54 @@ void Generate_Generic_Instance_Body (Symbol *inst_sym,
   cg->has_return = false;
   cg->block_terminated = false;  // Reset for new function
 
+  // Emit %__frame.X aliases for uplevel access into the enclosing function's
+  // frame. The generic-actual binding loop below may reference these (e.g.
+  // `NEW_G IS NEW G(VAL)` lowers G's formal X to a load from VAL via
+  // %__frame.val_s###), so the aliases must dominate those loads. They depend
+  // only on %__parent_frame (a function parameter), so it's safe to put them
+  // at the very top of the entry block. Mirrors Generate_Subprogram_Body's
+  // and Generate_Task_Body's alias setup.
+  if (is_nested) {
+    Scope *parent_scope = enclosing_subprog ? enclosing_subprog->scope : NULL;
+    if (parent_scope) {
+      #define MAX_INST_FRAME_ALIASES 512
+      uint32_t inst_emitted_ids[MAX_INST_FRAME_ALIASES];
+      uint32_t inst_emitted_count = 0;
+      for (uint32_t i = 0; i < parent_scope->symbol_count; i++) {
+        Symbol *var = parent_scope->symbols[i];
+        if (var and (var->kind == SYMBOL_VARIABLE or var->kind == SYMBOL_PARAMETER or
+              var->kind == SYMBOL_DISCRIMINANT or
+              (var->kind == SYMBOL_CONSTANT and not var->is_named_number))) {
+          bool dup = false;
+          for (uint32_t j = 0; j < inst_emitted_count; j++)
+            if (var->unique_id == inst_emitted_ids[j]) { dup = true; break; }
+          if (dup) continue;
+          if (inst_emitted_count < MAX_INST_FRAME_ALIASES)
+            inst_emitted_ids[inst_emitted_count++] = var->unique_id;
+          Emit ("  %%__frame.");
+          Emit_Symbol_Name (var);
+          Emit (" = getelementptr i8, ptr %%__parent_frame, i64 %lld\n",
+             (long long)(var->frame_offset));
+        }
+      }
+      for (uint32_t i = 0; i < parent_scope->frame_var_count; i++) {
+        Symbol *var = parent_scope->frame_vars[i];
+        if (not var) continue;
+        bool dup = false;
+        for (uint32_t j = 0; j < inst_emitted_count; j++)
+          if (var->unique_id == inst_emitted_ids[j]) { dup = true; break; }
+        if (dup) continue;
+        if (inst_emitted_count < MAX_INST_FRAME_ALIASES)
+          inst_emitted_ids[inst_emitted_count++] = var->unique_id;
+        Emit ("  %%__frame.");
+        Emit_Symbol_Name (var);
+        Emit (" = getelementptr i8, ptr %%__parent_frame, i64 %lld\n",
+           (long long)(var->frame_offset));
+      }
+      #undef MAX_INST_FRAME_ALIASES
+    }
+  }
+
   // Get parameter symbols from template body's specification (they have
   // the unique_ids that match the body's code references)
   Syntax_Node *body_spec = template_body->subprogram_body.specification;
@@ -36089,13 +36163,20 @@ void Generate_Task_Body (Syntax_Node *node) {
   memset (cg->temp_type_keys, 0, sizeof (cg->temp_type_keys));
   memset (cg->temp_is_fat_alloca, 0, sizeof (cg->temp_is_fat_alloca));
 
-  // Create frame aliases for accessing enclosing scope variables.                                 
-  // Task bodies can reference variables from the enclosing scope                                   
-  // (RM 9.1). The parent passed %__parent_frame pointing to its frame.                            
-  // Use the task symbol's defining_scope to get the correct scope                                  
-  // (important for tasks in DECLARE blocks which have their own scope).                           
-  //                                                                                                
-  Scope *parent_scope = node->symbol ? node->symbol->defining_scope : NULL;
+  // Create frame aliases for accessing enclosing scope variables.
+  // Task bodies can reference variables from the enclosing scope (RM 9.1).
+  // The parent passed %__parent_frame pointing to the *enclosing subprogram's*
+  // frame, not the task's immediate DECLARE-block scope. So aliases must be
+  // built against the enclosing subprogram's scope; its `frame_vars` already
+  // aggregates any DECLARE-block variables that share the same function frame.
+  // Using `node->symbol->defining_scope` (the task's DECLARE-block scope)
+  // misses outer variables when the task lives inside a DECLARE block.
+  // Note: task bodies are emitted via Process_Deferred_Bodies *after* the
+  // enclosing function has returned, so cg->current_function has been popped
+  // — we recover the enclosing function from the task symbol's parent chain.
+  Symbol *enclosing_subp = Find_Enclosing_Subprogram (node->symbol);
+  Scope  *parent_scope   = enclosing_subp ? enclosing_subp->scope : NULL;
+  if (not parent_scope and node->symbol) parent_scope = node->symbol->defining_scope;
 
   // Dedup by unique_id (same approach as Generate_Subprogram_Body)
   if (parent_scope) {
