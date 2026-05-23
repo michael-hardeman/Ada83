@@ -16333,9 +16333,13 @@ Token_Kind Token_From_Op_Name (String_Slice name) {
 // Is sym an uplevel reference requiring access through __parent_frame?
 bool Is_Uplevel_Access (const Symbol *sym) {
   if (not cg->current_function or not sym) return false;
-  // Parameters are always local to the current function
-  if (sym->kind == SYMBOL_PARAMETER) return false;
   Symbol *owner = sym->defining_scope ? sym->defining_scope->owner : NULL;
+
+  // Parameter of the current function is local; parameter of an
+  // enclosing function (e.g., outer subprogram's IN OUT param read by
+  // a nested helper) is uplevel and needs %__frame.X.
+  if (sym->kind == SYMBOL_PARAMETER and owner == cg->current_function)
+    return false;
   if (not cg->is_nested or not owner) return false;
   // Local to current function or its generic template
   if (owner == cg->current_function) return false;
@@ -19816,7 +19820,13 @@ uint32_t Normalize_To_Fat_Pointer (Syntax_Node *expr, uint32_t raw, Type_Info *t
   if (Type_Is_Character (type)) {
     uint32_t ca = Emit_Temp ();
     Emit ("  %%t%u = alloca i8\n", ca);
-    uint32_t ct = Emit_Convert (raw, Integer_Arith_Type (), "i8");
+
+    // Source may already be i8 (array element load), or i32 (Character'POS
+    // result widened). Use Expression_Llvm_Type, fall back to tracked
+    // temp type, then iat.
+    const char *src_t = expr ? Expression_Llvm_Type (expr) : NULL;
+    if (not src_t or src_t[0] == '\0') src_t = Integer_Arith_Type ();
+    uint32_t ct = Emit_Convert (raw, src_t, "i8");
     Emit ("  store i8 %%t%u, ptr %%t%u\n", ct, ca);
     return Emit_Fat_Pointer (ca, 1, 1, bt);
   }
@@ -21984,12 +21994,14 @@ uint32_t Generate_Apply (Syntax_Node *node) {
           addr_node = addr_node->apply.arguments.items[0];
         }
 
-        // Get the actual's address
+        // Get the actual's address. Use Emit_Symbol_Storage so uplevel
+        // references (from a nested subprogram into the enclosing
+        // frame) emit %__frame.X instead of %X.
         uint32_t actual_addr;
         if (addr_node->kind == NK_IDENTIFIER and addr_node->symbol) {
           actual_addr = Emit_Temp ();
-          Emit ("  %%t%u = getelementptr i8, ptr %%", actual_addr);
-          Emit_Symbol_Name (addr_node->symbol);
+          Emit ("  %%t%u = getelementptr i8, ptr ", actual_addr);
+          Emit_Symbol_Storage (addr_node->symbol);
           Emit (", i64 0  ; address for OUT/IN OUT\n");
         } else {
           actual_addr = Generate_Composite_Address (addr_node);
@@ -41584,6 +41596,37 @@ void Load_Package_Spec (String_Slice name, char *src) {
             break;
           }
         }
+      }
+    }
+    else if (unit->kind == NK_PROCEDURE_BODY or
+         unit->kind == NK_FUNCTION_BODY or
+         unit->kind == NK_PROCEDURE_SPEC or
+         unit->kind == NK_FUNCTION_SPEC) {
+
+      // Library-level subprogram (e.g., WITH CHECK_FILE where CHECK_FILE
+      // is `PROCEDURE CHECK_FILE (...) IS ... END;`). Register a
+      // SYMBOL_PROCEDURE / SYMBOL_FUNCTION so callers can resolve it.
+      // Resolve USE clauses from the loaded unit's context so types from
+      // WITH'd packages (e.g. TEXT_IO.FILE_TYPE) are visible when
+      // resolving the procedure's parameter types.
+      if (cu->compilation_unit.context) {
+        Node_List *uses = &cu->compilation_unit.context->context.use_clauses;
+        for (uint32_t i = 0; i < uses->count; i++) {
+          Resolve_Declaration (uses->items[i]);
+        }
+      }
+      // Delegate to Resolve_Declaration which fully handles the body
+      // (param resolution, body declarations, statements). This sets
+      // unit->symbol as a side effect of NK_PROCEDURE_BODY handling.
+      Resolve_Declaration (unit);
+
+      // If the WITH'd unit is a body, queue it for codegen so the
+      // emitted .ll defines @check_file (etc.) rather than just
+      // declaring it extern. Skip mere spec compilation units.
+      if ((unit->kind == NK_PROCEDURE_BODY or unit->kind == NK_FUNCTION_BODY) and
+        Loaded_Body_Count < 128 and not Body_Already_Loaded (name)) {
+        Mark_Body_Loaded (name);
+        Loaded_Package_Bodies[Loaded_Body_Count++] = cu;
       }
     }
     else if (unit->kind == NK_GENERIC_DECL) {
