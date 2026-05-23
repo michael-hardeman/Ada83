@@ -18658,9 +18658,19 @@ uint32_t Generate_Lvalue (Syntax_Node *node) {
       const char *dyn_lv_bt = NULL;
       uint32_t dynamic_high = 0;
 
-      // Access-to-array: load the access value to get array data pointer
+      // Access-to-array: load the access value to get array data pointer.
+      // If the access is stored as a fat pointer (designated type is or
+      // derives from an unconstrained array), extract the data slot so the
+      // GEP and bounds check operate on a plain ptr.
       if (implicit_access_deref) {
-        base = Generate_Expression (node->apply.prefix);
+        uint32_t raw = Generate_Expression (node->apply.prefix);
+        const char *raw_t = Expression_Llvm_Type (node->apply.prefix);
+        if (raw_t and Llvm_Type_Is_Fat_Pointer (raw_t)) {
+          const char *bt = Array_Bound_Llvm_Type (node->apply.prefix->type);
+          base = Emit_Fat_Pointer_Data (raw, bt);
+        } else {
+          base = raw;
+        }
       } else if (array_sym and (Type_Is_Unconstrained_Array (prefix_type) or
                 Type_Has_Dynamic_Bounds (prefix_type))) {
 
@@ -19035,17 +19045,19 @@ uint32_t Generate_Identifier (Syntax_Node *node) {
         Emit ("  %%t%u = getelementptr i8, ptr ", t);
         Emit_Symbol_Storage (sym);
         Emit (", i64 0  ; constrained array ref\n");
+        Temp_Set_Type (t, "ptr");
         break;
       }
 
-      // Records are composite types stored as [N x i8] allocas.                                   
-      // Like constrained arrays, the alloca address IS the value -                                 
-      // no load needed.                                                                           
-      //                                                                                            
+      // Records are composite types stored as [N x i8] allocas.
+      // Like constrained arrays, the alloca address IS the value -
+      // no load needed.
+      //
       if (Type_Is_Record (ty)) {
         Emit ("  %%t%u = getelementptr i8, ptr ", t);
         Emit_Symbol_Storage (sym);
         Emit (", i64 0  ; record ref\n");
+        Temp_Set_Type (t, "ptr");
         break;
       }
       // Fall back to the expression's resolved type if the symbol's type
@@ -19160,6 +19172,7 @@ uint32_t Generate_Identifier (Syntax_Node *node) {
         Emit ("  %%t%u = getelementptr i8, ptr ", t);
         Emit_Symbol_Storage (sym);
         Emit (", i64 0  ; record constant ref\n");
+        Temp_Set_Type (t, "ptr");
 
       // Typed constant: try compile-time evaluation first.                                        
       // Constants from WITHed packages (e.g. TEXT_IO.UNBOUNDED)                                    
@@ -19720,6 +19733,20 @@ uint32_t Generate_Composite_Address (Syntax_Node *node) {
     }
   }
 
+  // Multi-dimensional indexed component or unhandled access: delegate to
+  // Generate_Lvalue, which computes the element address regardless of
+  // dimensionality. Needed for IN OUT parameter actuals like X(I,J).
+  if (node->kind == NK_APPLY and node->apply.arguments.count > 1 and
+    node->apply.prefix) {
+    Type_Info *prefix_type = node->apply.prefix->type;
+    Type_Info *array_type = prefix_type;
+    if (Type_Is_Access (prefix_type) and prefix_type->access.designated_type)
+      array_type = prefix_type->access.designated_type;
+    if (array_type and (array_type->kind == TYPE_ARRAY or
+                array_type->kind == TYPE_STRING))
+      return Generate_Lvalue (node);
+  }
+
   // Fallback: for expressions that return a pointer (like composite values)
   return Generate_Expression (node);
 }
@@ -19792,6 +19819,18 @@ uint32_t Normalize_To_Fat_Pointer (Syntax_Node *expr, uint32_t raw, Type_Info *t
     uint32_t ct = Emit_Convert (raw, Integer_Arith_Type (), "i8");
     Emit ("  store i8 %%t%u, ptr %%t%u\n", ct, ca);
     return Emit_Fat_Pointer (ca, 1, 1, bt);
+  }
+
+  // RM 4.5.3: scalar element & array - wrap the scalar as a single-element
+  // array. Used for ARR & X where X is the array's element type.
+  if (type and not Type_Is_Character (type) and not Type_Is_Array_Like (type) and
+    (Type_Is_Scalar (type) or Type_Is_Numeric (type) or Type_Is_Boolean (type) or
+     Type_Is_Enumeration (type))) {
+    const char *st = Type_To_Llvm (type);
+    uint32_t sa = Emit_Temp ();
+    Emit ("  %%t%u = alloca %s  ; singleton elem alloca\n", sa, st);
+    Emit ("  store %s %%t%u, ptr %%t%u\n", st, raw, sa);
+    return Emit_Fat_Pointer (sa, 1, 1, bt);
   }
   if (Type_Is_Constrained_Array (type) and type->array.index_count > 0) {
     int128_t lo = Type_Bound_Value (type->array.indices[0].low_bound);
@@ -21932,15 +21971,28 @@ uint32_t Generate_Apply (Syntax_Node *node) {
         Parameter_Mode pmode = sym->parameters[param_idx].mode;
         Type_Info *formal_type = sym->parameters[param_idx].param_type;
 
+        // RM 6.4.1(7): a type conversion as an OUT/IN OUT actual is
+        // equivalent to the conversion of its operand. Peel TYPE(X) so
+        // we take the address of X, not the value of the conversion.
+        Syntax_Node *addr_node = arg;
+        while (addr_node and addr_node->kind == NK_APPLY and
+             addr_node->apply.prefix and
+             addr_node->apply.prefix->symbol and
+             (addr_node->apply.prefix->symbol->kind == SYMBOL_TYPE or
+              addr_node->apply.prefix->symbol->kind == SYMBOL_SUBTYPE) and
+             addr_node->apply.arguments.count == 1) {
+          addr_node = addr_node->apply.arguments.items[0];
+        }
+
         // Get the actual's address
         uint32_t actual_addr;
-        if (arg->kind == NK_IDENTIFIER and arg->symbol) {
+        if (addr_node->kind == NK_IDENTIFIER and addr_node->symbol) {
           actual_addr = Emit_Temp ();
           Emit ("  %%t%u = getelementptr i8, ptr %%", actual_addr);
-          Emit_Symbol_Name (arg->symbol);
+          Emit_Symbol_Name (addr_node->symbol);
           Emit (", i64 0  ; address for OUT/IN OUT\n");
         } else {
-          actual_addr = Generate_Composite_Address (arg);
+          actual_addr = Generate_Composite_Address (addr_node);
         }
 
         // RM 6.2: scalar and access types use copy-in/copy-out
@@ -22051,7 +22103,13 @@ uint32_t Generate_Apply (Syntax_Node *node) {
           //                                                                                        
           if (formal_needs_fat and actual_is_constrained) {
             const char *arg_llvm = Expression_Llvm_Type (arg);
-            if (not Llvm_Type_Is_Fat_Pointer (arg_llvm)) {
+
+            // Skip wrap if actual already runtime-produces a fat ptr
+            // (concat, slice, string literal) even though its declared
+            // type's Llvm form is "ptr".
+            bool already_fat = Llvm_Type_Is_Fat_Pointer (arg_llvm) or
+                       Expression_Produces_Fat_Pointer (arg, actual_type);
+            if (not already_fat) {
               const char *abt = Array_Bound_Llvm_Type (actual_type);
               uint32_t ndims_a = actual_type->array.index_count;
 
