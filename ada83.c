@@ -8673,6 +8673,7 @@ void Symbol_Manager_Init_Predefined (void) {
   Symbol *pkg_standard = Symbol_New (SYMBOL_PACKAGE, S("STANDARD"), No_Location);
   Type_Info *pkg_standard_type = Type_New (TYPE_PACKAGE, S("STANDARD"));
   pkg_standard->type = pkg_standard_type;
+  pkg_standard->scope = sm->global_scope;  // RM 8.6: STANDARD owns the global scope
   Symbol_Add (pkg_standard);
 
   // ASCII package (RM C.3) - predefined character constants
@@ -8862,14 +8863,16 @@ Type_Info *Resolve_Selected (Syntax_Node *node) {
     }
     Report_Error (node->location, "no component '%.*s' in record type",
           node->selected.selector.length, node->selected.selector.data);
-  } else if (Type_Is_Task (prefix_type) or
-         (Type_Is_Access (prefix_type) and prefix_type->access.designated_type and
-        Type_Is_Task (prefix_type->access.designated_type))) {
+  } else if (Type_Is_Task (record_type) or
+         (Type_Is_Access (record_type) and record_type->access.designated_type and
+        Type_Is_Task (record_type->access.designated_type))) {
 
     // Task entry selection: T.E1 where T is a task object (RM 9.5).
     // Also handles P.E1 where P is access-to-task (implicit dereference).
-    Type_Info *task_type = Type_Is_Task (prefix_type) ? prefix_type
-               : prefix_type->access.designated_type;
+    // record_type was unwrapped from private/incomplete by the prior loop,
+    // so this catches LIMITED PRIVATE types whose full view is a task type.
+    Type_Info *task_type = Type_Is_Task (record_type) ? record_type
+               : record_type->access.designated_type;
     Symbol *type_sym = task_type->defining_symbol;
     if (type_sym) {
       for (uint32_t i = 0; i < type_sym->exported_count; i++) {
@@ -9058,10 +9061,10 @@ Type_Info *Resolve_Selected (Syntax_Node *node) {
       }
     }
 
-    // For procedure/function prefix, search the subprogram's scope.                               
-    // This handles cases like MAIN.A_B_C where MAIN is a procedure                                 
-    // and A_B_C is an enum literal or type declared within it.                                    
-    //                                                                                              
+    // For procedure/function prefix, search the subprogram's scope.
+    // This handles cases like MAIN.A_B_C where MAIN is a procedure
+    // and A_B_C is an enum literal or type declared within it.
+    //
     if (prefix_sym and (prefix_sym->kind == SYMBOL_PROCEDURE or
               prefix_sym->kind == SYMBOL_FUNCTION) and
       prefix_sym->scope) {
@@ -9072,6 +9075,24 @@ Type_Info *Resolve_Selected (Syntax_Node *node) {
           s->visibility >= VIS_IMMEDIATELY_VISIBLE) {
           node->symbol = s;
           node->type = s->type;
+          return node->type;
+        }
+      }
+    }
+
+    // RM 8.3: a block label denotes its block as a declarative region.
+    // LABEL.X resolves X in the block's scope (only symbols declared
+    // directly in that block, not inherited from enclosing scopes).
+    //
+    if (prefix_sym and prefix_sym->kind == SYMBOL_LABEL and prefix_sym->scope) {
+      Scope *block_scope = prefix_sym->scope;
+      uint32_t hash = Symbol_Hash_Name (node->selected.selector);
+      for (Symbol *s = block_scope->buckets[hash]; s; s = s->next_in_bucket) {
+        if (Slice_Equal_Ignore_Case (s->name, node->selected.selector) and
+          s->defining_scope == block_scope) {
+          node->symbol = s;
+          node->type = (s->kind == SYMBOL_FUNCTION and s->return_type)
+                 ? s->return_type : s->type;
           return node->type;
         }
       }
@@ -12756,6 +12777,12 @@ void Resolve_Statement (Syntax_Node *node) {
       // Inherit owner from enclosing scope for proper symbol parenting
       Symbol_Manager_Push_Scope (sm->current_scope->owner);
 
+      // RM 8.3: a block label introduces a declarative region. Attach the
+      // pushed scope to the label symbol so expanded names like LABEL.X
+      // can resolve X in the block's declarations.
+      if (node->block_stmt.label_symbol)
+        node->block_stmt.label_symbol->scope = sm->current_scope;
+
       // Resolve declarations first (adds symbols to scope)
       Resolve_Declaration_List (&node->block_stmt.declarations);
 
@@ -13628,6 +13655,31 @@ void Resolve_Declaration (Syntax_Node *node) {
       break;
 
     // Resolve the renamed subprogram
+    case NK_PACKAGE_RENAMING:
+
+      // RM 8.5: PACKAGE L RENAMES D;
+      // L denotes the same package D - any selected component L.X
+      // resolves to D.X. Create a SYMBOL_PACKAGE whose scope and
+      // exports alias D's.
+      {
+        if (node->package_renaming.old_name) {
+          Resolve_Expression (node->package_renaming.old_name);
+        }
+        Symbol *target = node->package_renaming.old_name ?
+                 node->package_renaming.old_name->symbol : NULL;
+        Symbol *sym = Symbol_New (SYMBOL_PACKAGE,
+                      node->package_renaming.new_name,
+                      node->location);
+        if (target and target->kind == SYMBOL_PACKAGE) {
+          sym->scope          = target->scope;
+          sym->exported       = target->exported;
+          sym->exported_count = target->exported_count;
+          sym->renamed_object = (Syntax_Node *)target;
+        }
+        Symbol_Add (sym);
+        node->symbol = sym;
+      }
+      break;
     case NK_SUBPROGRAM_RENAMING:
 
       // PROCEDURE P RENAMES Q; or FUNCTION F RENAMES G;
@@ -13979,12 +14031,31 @@ void Resolve_Declaration (Syntax_Node *node) {
     // Task declaration creates a task type and optionally an object
     case NK_TASK_SPEC:
       {
-        Symbol *type_sym = Symbol_New (SYMBOL_TYPE, node->task_spec.name, node->location);
-        Type_Info *type = Type_New (TYPE_TASK, node->task_spec.name);
-        type_sym->type = type;
-        type->defining_symbol = type_sym;
-        type_sym->declaration = node;
-        Symbol_Add (type_sym);
+        // RM 7.4.1: a TASK TYPE in a package private part completes a
+        // matching LIMITED PRIVATE declaration in the visible part.
+        // Reuse the existing symbol so the private->full link is intact.
+        Symbol *type_sym = NULL;
+        Symbol *existing = Symbol_Find (node->task_spec.name);
+        if (node->task_spec.is_type and existing and
+          existing->kind == SYMBOL_TYPE and existing->type and
+          (existing->type->kind == TYPE_LIMITED_PRIVATE or
+           existing->type->kind == TYPE_PRIVATE or
+           existing->type->kind == TYPE_UNKNOWN or
+           existing->type->kind == TYPE_INCOMPLETE) and
+          existing->defining_scope == sm->current_scope) {
+          type_sym = existing;
+          type_sym->type->kind = TYPE_TASK;
+          type_sym->type->defining_symbol = type_sym;
+          type_sym->declaration = node;
+        } else {
+          type_sym = Symbol_New (SYMBOL_TYPE, node->task_spec.name, node->location);
+          Type_Info *type = Type_New (TYPE_TASK, node->task_spec.name);
+          type_sym->type = type;
+          type->defining_symbol = type_sym;
+          type_sym->declaration = node;
+          Symbol_Add (type_sym);
+        }
+        Type_Info *type = type_sym->type;
         node->symbol = type_sym;
 
         // If not a task TYPE, also create an object of that type
@@ -18722,12 +18793,29 @@ uint32_t Generate_Lvalue (Syntax_Node *node) {
           flat_idx = idx;
         }
 
-        // Compute element address
+        // Compute element address. Composite elements (records, constrained
+        // arrays of fixed size) are stored inline as N-byte blobs; their
+        // Type_To_Llvm is "ptr" which would give the wrong stride. Index
+        // by byte offset for those.
         Type_Info *elem_type_info = prefix_type->array.element_type;
-        const char *elem_type = Type_To_Llvm (elem_type_info);
+        bool composite_inline = elem_type_info and elem_type_info->size > 0 and
+          (Type_Is_Record (elem_type_info) or
+           (Type_Is_Array_Like (elem_type_info) and
+            elem_type_info->array.is_constrained and
+            not Type_Has_Dynamic_Bounds (elem_type_info)));
         uint32_t ptr = Emit_Temp ();
-        Emit ("  %%t%u = getelementptr %s, ptr %%t%u, %s %%t%u  ; elem lvalue\n",
-           ptr, elem_type, base, idx_lv_iat, flat_idx);
+        if (composite_inline) {
+          uint64_t bytes = (uint64_t)elem_type_info->size;
+          uint32_t offset = Emit_Temp ();
+          Emit ("  %%t%u = mul %s %%t%u, %llu\n",
+             offset, idx_lv_iat, flat_idx, (unsigned long long)bytes);
+          Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u  ; composite elem lvalue\n",
+             ptr, base, idx_lv_iat, offset);
+        } else {
+          const char *elem_type = Type_To_Llvm (elem_type_info);
+          Emit ("  %%t%u = getelementptr %s, ptr %%t%u, %s %%t%u  ; elem lvalue\n",
+             ptr, elem_type, base, idx_lv_iat, flat_idx);
+        }
         return ptr;
       }
     }
@@ -29669,13 +29757,26 @@ void Generate_Assignment (Syntax_Node *node) {
       // Generate_Lvalue handles both unconstrained (fat pointer) and                               
       // constrained arrays - computes element address in one call.                                
       //                                                                                            
-      const char *elem_type_str = Type_To_Llvm (prefix_type->array.element_type);
+      Type_Info *aelem_ti = prefix_type->array.element_type;
+      const char *elem_type_str = Type_To_Llvm (aelem_ti);
+      bool aelem_composite = aelem_ti and aelem_ti->size > 0 and
+        (Type_Is_Record (aelem_ti) or
+         (Type_Is_Array_Like (aelem_ti) and
+          aelem_ti->array.is_constrained and
+          not Type_Has_Dynamic_Bounds (aelem_ti)));
       uint32_t elem_ptr = Generate_Lvalue (target);
       uint32_t value = Generate_Expression (node->assignment.value);
-      const char *value_type = Expression_Llvm_Type (node->assignment.value);
-      value = Emit_Convert (value, value_type, elem_type_str);
-      Emit ("  store %s %%t%u, ptr %%t%u  ; array element assign\n",
-         elem_type_str, value, elem_ptr);
+      if (aelem_composite) {
+        Emit ("  call void @llvm.memcpy.p0.p0.i64("
+           "ptr %%t%u, ptr %%t%u, i64 %llu, i1 false)"
+           "  ; composite array element assign\n",
+           elem_ptr, value, (unsigned long long)aelem_ti->size);
+      } else {
+        const char *value_type = Expression_Llvm_Type (node->assignment.value);
+        value = Emit_Convert (value, value_type, elem_type_str);
+        Emit ("  store %s %%t%u, ptr %%t%u  ; array element assign\n",
+           elem_type_str, value, elem_ptr);
+      }
       return;
     }
 
