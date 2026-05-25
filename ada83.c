@@ -2253,6 +2253,12 @@ void Emit_Length_Check (uint32_t    src_length,
                         const char *len_type,
                         Type_Info  *array_type);
 
+void Emit_Slice_Bound_Check (uint32_t    slice_lo,
+                             uint32_t    slice_hi,
+                             uint32_t    arr_lo,
+                             uint32_t    arr_hi,
+                             const char *iat);
+
 // ???
 void Emit_Access_Check (uint32_t ptr_val, Type_Info *acc_type);
 
@@ -10583,10 +10589,14 @@ Type_Info *Resolve_Expression (Syntax_Node *node) {
             // RM 6.6: pre-set arg type for context-sensitive
             // attributes so overloaded names resolve correctly.
             //   POS/SUCC/PRED/IMAGE: arg has prefix type.
-            if (needs_enum_context and arg and not arg->type and
+            //   VAL: arg is INTEGER (RM 3.5.5).
+            bool is_val = Slice_Equal_Ignore_Case (attr, S("VAL"));
+            if (arg and not arg->type and
               (arg->kind == NK_IDENTIFIER or arg->kind == NK_APPLY or
-               arg->kind == NK_BINARY_OP))
-              arg->type = prefix_type;
+               arg->kind == NK_BINARY_OP)) {
+              if (needs_enum_context) arg->type = prefix_type;
+              else if (is_val) arg->type = sm->type_integer;
+            }
             Resolve_Expression (arg);
           }
         }
@@ -16941,6 +16951,36 @@ uint32_t Emit_Index_Check (uint32_t index,
   return index;
 }
 
+// RM 4.1.2: non-null slice A(L..H) requires L and H both in A'FIRST..A'LAST.
+// Skip check if slice is null (L > H). Emits CE on violation.
+void Emit_Slice_Bound_Check (uint32_t slice_lo, uint32_t slice_hi,
+                  uint32_t arr_lo, uint32_t arr_hi,
+                  const char *iat) {
+  uint32_t is_null = Emit_Temp ();
+  Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u  ; null slice?\n",
+     is_null, iat, slice_lo, slice_hi);
+  uint32_t ok_lbl = cg->label_id++;
+  uint32_t chk_lbl = cg->label_id++;
+  Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
+     is_null, ok_lbl, chk_lbl);
+  cg->block_terminated = true;
+  Emit_Label_Here (chk_lbl);
+  uint32_t fail_lbl = cg->label_id++;
+  uint32_t a = Emit_Temp (); Emit ("  %%t%u = icmp slt %s %%t%u, %%t%u\n", a, iat, slice_lo, arr_lo);
+  uint32_t b = Emit_Temp (); Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u\n", b, iat, slice_lo, arr_hi);
+  uint32_t c = Emit_Temp (); Emit ("  %%t%u = icmp slt %s %%t%u, %%t%u\n", c, iat, slice_hi, arr_lo);
+  uint32_t d = Emit_Temp (); Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u\n", d, iat, slice_hi, arr_hi);
+  uint32_t ab = Emit_Temp (); Emit ("  %%t%u = or i1 %%t%u, %%t%u\n", ab, a, b);
+  uint32_t cd = Emit_Temp (); Emit ("  %%t%u = or i1 %%t%u, %%t%u\n", cd, c, d);
+  uint32_t any = Emit_Temp (); Emit ("  %%t%u = or i1 %%t%u, %%t%u\n", any, ab, cd);
+  Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n", any, fail_lbl, ok_lbl);
+  cg->block_terminated = true;
+  Emit_Label_Here (fail_lbl);
+  Emit_Raise_Constraint_Error ("slice bound outside array");
+  Emit_Label_Here (ok_lbl);
+  cg->block_terminated = false;
+}
+
 // Emit_Length_Check - array length mismatch check (RM 4.5.2, 5.2.1).
 // Checks that source and destination arrays have matching lengths.
 void Emit_Length_Check (uint32_t src_length, uint32_t dst_length,
@@ -19568,8 +19608,36 @@ uint32_t Generate_Identifier (Syntax_Node *node) {
            t, efty, (long long)pos);
         Temp_Set_Type (t, efty); }
 
-      // Generate actual function call
+      // Generate actual function call.
+      // If the function has parameters (all with defaults, per RM 6.4.2),
+      // synthesize an NK_APPLY(actual, [defaults]) and route through
+      // Generate_Apply. All params must have defaults; otherwise it's a
+      // signature mismatch and we leave it to the fallback (which will
+      // emit a wrong 0-arg call but at least won't crash here).
+      } else if (actual->kind == SYMBOL_FUNCTION and
+                 actual->parameter_count > 0) {
+        bool all_default = true;
+        for (uint32_t i = 0; i < actual->parameter_count; i++) {
+          if (not actual->parameters[i].default_value) {
+            all_default = false; break;
+          }
+        }
+        if (all_default) {
+          Syntax_Node *app = Node_New (NK_APPLY, node->location);
+          app->apply.prefix = node;
+          app->symbol = actual;
+          app->type = actual->return_type;
+          for (uint32_t i = 0; i < actual->parameter_count; i++) {
+            Node_List_Push (&app->apply.arguments,
+                            actual->parameters[i].default_value);
+          }
+          return Generate_Apply (app);
+        }
+        // Fall through to original emit (zero-arg call) — may produce
+        // wrong IR but maintains existing behavior for malformed calls.
+        goto direct_emit_function_call;
       } else if (actual->kind == SYMBOL_FUNCTION) {
+        direct_emit_function_call:;
         const char *ret_type = actual->return_type ?
           Type_To_Llvm_Sig (actual->return_type) : Integer_Arith_Type ();
         bool callee_is_nested = Subprogram_Needs_Static_Chain (actual);
@@ -22368,6 +22436,45 @@ uint32_t Generate_Apply (Syntax_Node *node) {
             Emit ("  %%t%u = load %s, ptr %%t%u\n", cur_val, ld_ty, args[i]);
             Emit_Constraint_Check (cur_val, formal_type, arg->type);
           }
+
+          // RM 6.4.1: for IN OUT / OUT record formal with constrained
+          // discriminants, the actual's discriminants must match the
+          // formal subtype's constraint.
+          if (formal_type and Type_Is_Record (formal_type) and
+            formal_type->record.has_disc_constraints and
+            formal_type->record.discriminant_count > 0 and
+            formal_type->record.disc_constraint_values) {
+            const char *iat = Integer_Arith_Type ();
+            for (uint32_t di = 0; di < formal_type->record.discriminant_count; di++) {
+              Component_Info *dc = &formal_type->record.components[di];
+              if (not dc->component_type) continue;
+              const char *disc_llvm = Type_To_Llvm (dc->component_type);
+              uint32_t disc_ptr = Emit_Temp ();
+              Emit ("  %%t%u = getelementptr i8, ptr %%t%u, i64 %u  ; byref disc addr\n",
+                 disc_ptr, args[i], dc->byte_offset);
+              uint32_t disc_val = Emit_Temp ();
+              Emit ("  %%t%u = load %s, ptr %%t%u  ; load actual disc\n",
+                 disc_val, disc_llvm, disc_ptr);
+              if (strcmp (disc_llvm, iat) != 0)
+                disc_val = Emit_Convert (disc_val, disc_llvm, iat);
+              uint32_t expected;
+              Syntax_Node *disc_expr = formal_type->record.disc_constraint_exprs
+                              ? formal_type->record.disc_constraint_exprs[di]
+                              : NULL;
+              if (disc_expr) {
+                expected = Generate_Expression (disc_expr);
+                const char *exp_t = Expression_Llvm_Type (disc_expr);
+                if (exp_t and strcmp (exp_t, iat) != 0)
+                  expected = Emit_Convert (expected, exp_t, iat);
+              } else {
+                expected = Emit_Temp ();
+                Emit ("  %%t%u = add %s 0, %lld  ; expected disc\n",
+                   expected, iat,
+                   (long long)formal_type->record.disc_constraint_values[di]);
+              }
+              Emit_Discriminant_Check (disc_val, expected, iat, formal_type);
+            }
+          }
         }
       } else {
         // RM 4.8: Propagate target access type to allocator in parameter
@@ -22634,6 +22741,19 @@ uint32_t Generate_Apply (Syntax_Node *node) {
         uint32_t ret_val = Emit_Temp ();
         Emit ("  %%t%u = load %s, ptr %%t%u  ; copy-out\n",
            ret_val, copyback_llvm[i], args[i]);
+
+        // RM 6.4.1(17): on return from OUT/IN OUT scalar param, the
+        // value must satisfy the actual's subtype constraint. Apply
+        // check before storing back.
+        {
+          Syntax_Node *arg_node = node->apply.arguments.items[i];
+          Syntax_Node *arg = (arg_node->kind == NK_ASSOCIATION) ?
+            arg_node->association.expression : arg_node;
+          Type_Info *actual_type = arg ? arg->type : NULL;
+          if (actual_type and Type_Is_Scalar (actual_type))
+            ret_val = Emit_Constraint_Check_With_Type (ret_val, actual_type,
+              NULL, copyback_llvm[i]);
+        }
         Emit ("  store %s %%t%u, ptr %%t%u  ; copy-back to actual\n",
            copyback_llvm[i], ret_val, copyback_addr[i]);
 
@@ -22998,6 +23118,30 @@ uint32_t Generate_Apply (Syntax_Node *node) {
       // Generate slice bounds (these are the logical bounds of the slice)
       uint32_t slice_low = Generate_Expression (arg0->range.low);
       uint32_t slice_high = Generate_Expression (arg0->range.high);
+
+      // RM 4.1.2: for a non-null slice A(L..H), L and H must each be
+      // in A'FIRST..A'LAST.
+      {
+        const char *sl_iat = Integer_Arith_Type ();
+        uint32_t arr_lo, arr_hi;
+        if (has_dynamic_low) {
+          arr_lo = Emit_Convert (low_bound_val, dyn_bt, sl_iat);
+        } else {
+          int128_t lo = Array_Low_Bound (array_type);
+          arr_lo = Emit_Static_Int (lo, sl_iat);
+        }
+        if (array_type->array.index_count > 0 and
+          array_type->array.indices[0].high_bound.kind == BOUND_INTEGER) {
+          int128_t hi = Type_Bound_Value (array_type->array.indices[0].high_bound);
+          arr_hi = Emit_Static_Int (hi, sl_iat);
+        } else if (has_dynamic_low and high_bound_val > 0) {
+          arr_hi = Emit_Convert (high_bound_val, dyn_bt, sl_iat);
+        } else {
+          arr_hi = 0;
+        }
+        if (arr_hi > 0)
+          Emit_Slice_Bound_Check (slice_low, slice_high, arr_lo, arr_hi, sl_iat);
+      }
 
       // Compute zero-based offset for slice start
       // offset = (slice_low - array_low_bound) * elem_size
@@ -28111,6 +28255,9 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
                 if (arr_idx >= 0 and arr_idx < count) {
                   uint32_t val = Agg_Resolve_Elem (item->association.expression, multidim,
                     elem_is_composite, agg_type, elem_type, elem_ti);
+                  if (not elem_is_composite and elem_ti and Type_Is_Scalar (elem_ti))
+                    val = Emit_Constraint_Check_With_Type (val, elem_ti,
+                      item->association.expression->type, elem_type);
                   Agg_Store_At_Static (base, val, arr_idx,
                     elem_type, elem_size, elem_is_composite);
                   initialized[arr_idx] = true;
@@ -28136,6 +28283,9 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
               if (arr_idx >= 0 and arr_idx < count) {
                 uint32_t val = Agg_Resolve_Elem (item->association.expression, multidim,
                   elem_is_composite, agg_type, elem_type, elem_ti);
+                if (not elem_is_composite and elem_ti and Type_Is_Scalar (elem_ti))
+                  val = Emit_Constraint_Check_With_Type (val, elem_ti,
+                    item->association.expression->type, elem_type);
                 Agg_Store_At_Static (base, val, arr_idx,
                   elem_type, elem_size, elem_is_composite);
                 initialized[arr_idx] = true;
@@ -28187,6 +28337,9 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
             if (idx >= 0 and idx < count) {
               uint32_t val = Agg_Resolve_Elem (item->association.expression, multidim,
                 elem_is_composite, agg_type, elem_type, elem_ti);
+              if (not elem_is_composite and elem_ti and Type_Is_Scalar (elem_ti))
+                val = Emit_Constraint_Check_With_Type (val, elem_ti,
+                  item->association.expression->type, elem_type);
               Agg_Store_At_Static (base, val, idx,
                 elem_type, elem_size, elem_is_composite);
               initialized[idx] = true;
@@ -30212,6 +30365,17 @@ void Generate_Assignment (Syntax_Node *node) {
         // Length must use raw bounds (not index-adjusted) per Ada RM 5.2.1.
         uint32_t dest_lo_raw = Generate_Expression (arg->range.low);
         uint32_t dest_hi_raw = Generate_Expression (arg->range.high);
+
+        // RM 4.1.2: non-null slice bounds must be in array's range.
+        if (prefix_type->array.index_count > 0 and
+          prefix_type->array.indices[0].high_bound.kind == BOUND_INTEGER and
+          prefix_type->array.indices[0].low_bound.kind == BOUND_INTEGER) {
+          int128_t arr_lo_i = Type_Bound_Value (prefix_type->array.indices[0].low_bound);
+          int128_t arr_hi_i = Type_Bound_Value (prefix_type->array.indices[0].high_bound);
+          uint32_t arr_lo_c = Emit_Static_Int (arr_lo_i, csa_t);
+          uint32_t arr_hi_c = Emit_Static_Int (arr_hi_i, csa_t);
+          Emit_Slice_Bound_Check (dest_lo_raw, dest_hi_raw, arr_lo_c, arr_hi_c, csa_t);
+        }
         uint32_t length = Emit_Temp ();
         Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", length, csa_t, dest_hi_raw, dest_lo_raw);
 
@@ -30263,6 +30427,19 @@ void Generate_Assignment (Syntax_Node *node) {
               Emit (", %s 0\n", csa_t);
             }
             uint32_t src_start = Generate_Expression (src_range->range.low);
+            uint32_t src_end = Generate_Expression (src_range->range.high);
+
+            // RM 4.1.2: source slice bounds must be in src array's range.
+            if (not src_is_uncon and
+              src_type->array.index_count > 0 and
+              src_type->array.indices[0].low_bound.kind == BOUND_INTEGER and
+              src_type->array.indices[0].high_bound.kind == BOUND_INTEGER) {
+              int128_t sla = Type_Bound_Value (src_type->array.indices[0].low_bound);
+              int128_t sha = Type_Bound_Value (src_type->array.indices[0].high_bound);
+              uint32_t slc = Emit_Static_Int (sla, csa_t);
+              uint32_t shc = Emit_Static_Int (sha, csa_t);
+              Emit_Slice_Bound_Check (src_start, src_end, slc, shc, csa_t);
+            }
             if (src_is_uncon) {
               uint32_t src_fat_cvt = Emit_Convert (src_fat_low, ssb, csa_t);
               uint32_t adj = Emit_Temp ();
@@ -30622,20 +30799,52 @@ void Generate_Assignment (Syntax_Node *node) {
     // Source is unconstrained/string - extract data pointer from fat pointer
     } else if (src_is_fat_ptr) {
 
-      // Length check: verify source length matches constrained target length
+      // Length check: verify source length matches constrained target length.
+      // When target has dynamic bounds (BOUND_EXPR), Type_Bound_Value returns
+      // 0 → dst_length=1 (wrong). Load target's fat ptr at runtime and use
+      // its length instead. Also memcpy into target's .data ptr (not over
+      // the fat ptr struct itself).
       const char *ca_bt = Array_Bound_Llvm_Type (ty);
       uint32_t src_len = Emit_Fat_Pointer_Length (src_ptr, ca_bt);
       if (ty->array.index_count > 0) {
-        int128_t lo = Type_Bound_Value (ty->array.indices[0].low_bound);
-        int128_t hi = Type_Bound_Value (ty->array.indices[0].high_bound);
-        int128_t dst_length = hi - lo + 1;
-        if (dst_length < 0) dst_length = 0;
-        uint32_t dst_len = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, %s  ; constrained target length\n",
-           dst_len, ca_bt, I128_Decimal (dst_length));
+        bool dyn_bounds = (ty->array.indices[0].low_bound.kind == BOUND_EXPR or
+                  ty->array.indices[0].high_bound.kind == BOUND_EXPR);
+        uint32_t dst_len;
+        if (dyn_bounds and target_is_fat) {
+          // Load target fat ptr, extract length
+          uint32_t tfp = Emit_Load_Fat_Pointer (target_sym, ca_bt);
+          dst_len = Emit_Fat_Pointer_Length (tfp, ca_bt);
+        } else {
+          int128_t lo = Type_Bound_Value (ty->array.indices[0].low_bound);
+          int128_t hi = Type_Bound_Value (ty->array.indices[0].high_bound);
+          int128_t dst_length = hi - lo + 1;
+          if (dst_length < 0) dst_length = 0;
+          dst_len = Emit_Temp ();
+          Emit ("  %%t%u = add %s 0, %s  ; constrained target length\n",
+             dst_len, ca_bt, I128_Decimal (dst_length));
+        }
         Emit_Length_Check (src_len, dst_len, ca_bt, ty);
       }
-      Emit_Fat_Pointer_Copy_To_Name (src_ptr, target_sym, ca_bt);
+      if (target_is_fat) {
+        // Memcpy source data into target's data ptr (preserve fat struct).
+        uint32_t tfp = Emit_Load_Fat_Pointer (target_sym, ca_bt);
+        uint32_t tdata = Emit_Fat_Pointer_Data (tfp, ca_bt);
+        uint32_t sdata = Emit_Fat_Pointer_Data (src_ptr, ca_bt);
+        uint32_t slen = Emit_Fat_Pointer_Length (src_ptr, ca_bt);
+        // Multiply length by element size
+        uint32_t esz = ty->array.element_type ? ty->array.element_type->size : 1;
+        if (esz == 0) esz = 1;
+        uint32_t bytes = slen;
+        if (esz != 1) {
+          bytes = Emit_Temp ();
+          Emit ("  %%t%u = mul %s %%t%u, %u\n", bytes, ca_bt, slen, esz);
+        }
+        uint32_t bytes64 = Emit_Extend_To_I64 (bytes, ca_bt);
+        Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %%t%u, i1 false)  ; dyn-constrained array assign\n",
+           tdata, sdata, bytes64);
+      } else {
+        Emit_Fat_Pointer_Copy_To_Name (src_ptr, target_sym, ca_bt);
+      }
 
     // Target is fat pointer but source isn't aggregate/fat - store as fat ptr
     } else if (target_is_fat) {
