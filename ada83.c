@@ -15041,6 +15041,8 @@ void Resolve_Declaration (Syntax_Node *node) {
                   sym->convention = CONVENTION_C;
                 else if (Slice_Equal_Ignore_Case (conv, S("STDCALL")))
                   sym->convention = CONVENTION_STDCALL;
+                else if (Slice_Equal_Ignore_Case (conv, S("INTRINSIC")))
+                  sym->convention = CONVENTION_INTRINSIC;
               }
             }
           }
@@ -15142,6 +15144,16 @@ void Resolve_Declaration (Syntax_Node *node) {
                         node->location);
         inst_sym->declaration = node;
         inst_sym->generic_template = template;
+        // Propagate INTRINSIC convention from template so the call site
+        // can recognize the instance as needing inline lowering (e.g.
+        // UNCHECKED_CONVERSION) instead of an external call.
+        // The pragma CONVENTION(INTRINSIC, UNCHECKED_CONVERSION) in
+        // rts/unchecked_conversion.ads is processed elsewhere; recognize
+        // the predefined intrinsic generics by name as a fallback.
+        if (template->convention == CONVENTION_INTRINSIC or
+            Slice_Equal_Ignore_Case (template->name,
+                                     S("UNCHECKED_CONVERSION")))
+          inst_sym->convention = CONVENTION_INTRINSIC;
 
         // Process generic actuals and build mapping
         Node_List *formals = &template->declaration->generic_decl.formals;
@@ -22642,6 +22654,52 @@ uint32_t Generate_Apply (Syntax_Node *node) {
     if (call_target->kind == SYMBOL_GENERIC and cg->current_instance) {
       sym = cg->current_instance;
       call_target = sym;
+    }
+
+    // RM 13.10.2 / GNAT: UNCHECKED_CONVERSION is an intrinsic generic.
+    // Each instantiation creates a SYMBOL_FUNCTION with no body.
+    // Lower the call inline as a bit-reinterpret instead of emitting
+    // an external call. Pattern: alloca buffer wide enough for both
+    // src and dst, store src into it, load dst out. Works for any
+    // scalar/access/composite-of-equal-size combination because
+    // LLVM's untyped load/store reinterprets bits.
+    if (call_target->convention == CONVENTION_INTRINSIC and
+        call_target->generic_template and
+        Slice_Equal_Ignore_Case (call_target->generic_template->name,
+                                 S("UNCHECKED_CONVERSION")) and
+        node->apply.arguments.count == 1) {
+      Type_Info *src_ti = (sym->parameters and sym->parameter_count > 0)
+        ? sym->parameters[0].param_type : NULL;
+      Type_Info *dst_ti = sym->return_type;
+      const char *src_llvm = src_ti ? Type_To_Llvm (src_ti) : "i32";
+      const char *dst_llvm = dst_ti ? Type_To_Llvm (dst_ti) : "i32";
+      bool src_composite = src_ti and Type_Is_Composite (src_ti);
+      bool dst_composite = dst_ti and Type_Is_Composite (dst_ti);
+      uint32_t src_sz = src_ti ? src_ti->size : 8;
+      uint32_t dst_sz = dst_ti ? dst_ti->size : 8;
+      if (src_sz == 0) src_sz = 8;
+      if (dst_sz == 0) dst_sz = 8;
+      uint32_t buf_sz = src_sz > dst_sz ? src_sz : dst_sz;
+      uint32_t buf = Emit_Temp ();
+      Emit ("  %%t%u = alloca [%u x i8]  ; UNCHECKED_CONVERSION buffer\n",
+         buf, buf_sz);
+      if (src_composite) {
+        // args[0] is ptr to source data. Copy src_sz bytes into buf.
+        Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u,"
+              " i64 %u, i1 false)  ; UC src\n", buf, args[0], src_sz);
+      } else {
+        Emit ("  store %s %%t%u, ptr %%t%u  ; UC src\n",
+           src_llvm, args[0], buf);
+      }
+      if (dst_composite) {
+        // Return ptr to the buffer; caller's assignment will memcpy it.
+        return buf;
+      }
+      uint32_t res = Emit_Temp ();
+      Emit ("  %%t%u = load %s, ptr %%t%u  ; UC dst\n",
+         res, dst_llvm, buf);
+      Temp_Set_Type (res, dst_llvm);
+      return res;
     }
 
     // Check if calling a nested function (transitively inside another subprogram)
@@ -42406,6 +42464,118 @@ void Load_Package_Spec (String_Slice name, char *src) {
 
   // Done loading this package
   Loading_Set_Remove (name);
+
+  // Some files (ACATS .ada convention) contain both spec and body
+  // in a single file. Keep parsing additional compilation units from
+  // the SAME parser to pick up the body when it follows the spec.
+  // This handles generic procedures/functions like LENGTH_CHECK where
+  // the body must attach to the SYMBOL_GENERIC created above so
+  // Generate_Generic_Instance_Body has a body to emit at instantiation.
+  while (not Parser_At (&parser, TK_EOF)) {
+    Syntax_Node *more_cu = Parse_Compilation_Unit (&parser);
+    if (not more_cu or not more_cu->compilation_unit.unit) break;
+    Syntax_Node *more_unit = more_cu->compilation_unit.unit;
+    if (more_unit->kind == NK_PROCEDURE_BODY or
+        more_unit->kind == NK_FUNCTION_BODY) {
+      String_Slice body_name = more_unit->subprogram_body.specification
+        ? more_unit->subprogram_body.specification->subprogram_spec.name
+        : (String_Slice){0};
+      Symbol *gen_sym = body_name.data ? Symbol_Find (body_name) : NULL;
+      if (gen_sym and gen_sym->kind == SYMBOL_GENERIC) {
+        gen_sym->generic_body = more_unit;
+        more_unit->symbol = gen_sym;
+
+        // Process the body cu's WITH/USE clauses so types referenced
+        // by the body (e.g. UNCHECKED_CONVERSION) are visible.
+        if (more_cu->compilation_unit.context) {
+          Node_List *withs = &more_cu->compilation_unit.context->context.with_clauses;
+          for (uint32_t i = 0; i < withs->count; i++) {
+            Syntax_Node *wnode = withs->items[i];
+            for (uint32_t j = 0; j < wnode->use_clause.names.count; j++) {
+              Syntax_Node *pname = wnode->use_clause.names.items[j];
+              if (pname->kind == NK_IDENTIFIER) {
+                char *psrc = Lookup_Path (pname->string_val.text);
+                if (psrc) Load_Package_Spec (pname->string_val.text, psrc);
+              }
+            }
+          }
+          Node_List *uses = &more_cu->compilation_unit.context->context.use_clauses;
+          for (uint32_t i = 0; i < uses->count; i++) {
+            Resolve_Declaration (uses->items[i]);
+          }
+        }
+
+        // Resolve the body in the generic scope so identifiers bind to
+        // symbols. Mirrors the package-body branch below.
+        Symbol_Manager_Push_Scope (gen_sym);
+        Syntax_Node *spec = gen_sym->declaration;
+        if (spec and spec->kind == NK_GENERIC_DECL) {
+          Node_List *formals = &spec->generic_decl.formals;
+          for (uint32_t fi = 0; fi < formals->count; fi++) {
+            Syntax_Node *formal = formals->items[fi];
+            if (not formal) continue;
+            if (formal->symbol) Symbol_Add (formal->symbol);
+            if (formal->kind == NK_GENERIC_TYPE_PARAM and not formal->symbol) {
+              Symbol *type_sym = Symbol_New (SYMBOL_TYPE,
+                formal->generic_type_param.name, formal->location);
+              Type_Kind formal_kind = TYPE_PRIVATE;
+              switch (formal->generic_type_param.def_kind) {
+                case 2: formal_kind = TYPE_ENUMERATION; break;
+                case 3: formal_kind = TYPE_INTEGER;     break;
+                case 4: formal_kind = TYPE_FLOAT;       break;
+                case 5: formal_kind = TYPE_FIXED;       break;
+                case 6: formal_kind = TYPE_ARRAY;       break;
+                case 7: formal_kind = TYPE_ACCESS;      break;
+                default: formal_kind = TYPE_PRIVATE;    break;
+              }
+              type_sym->type = Type_New (formal_kind, formal->generic_type_param.name);
+              formal->symbol = type_sym;
+              Symbol_Add (type_sym);
+            }
+          }
+        }
+        // Install spec's parameters
+        Syntax_Node *bspec = more_unit->subprogram_body.specification;
+        if (bspec) {
+          Node_List *params = &bspec->subprogram_spec.parameters;
+          for (uint32_t i = 0; i < params->count; i++) {
+            Syntax_Node *ps = params->items[i];
+            if (ps and ps->kind == NK_PARAM_SPEC) {
+              if (ps->param_spec.param_type)
+                Resolve_Expression (ps->param_spec.param_type);
+              for (uint32_t j = 0; j < ps->param_spec.names.count; j++) {
+                Syntax_Node *nm = ps->param_spec.names.items[j];
+                Symbol *param_sym = Symbol_New (SYMBOL_PARAMETER,
+                  nm->string_val.text, nm->location);
+                if (ps->param_spec.param_type)
+                  param_sym->type = ps->param_spec.param_type->type;
+                Symbol_Add (param_sym);
+                nm->symbol = param_sym;
+              }
+            }
+          }
+        }
+        Resolve_Declaration_List (&more_unit->subprogram_body.declarations);
+        Resolve_Statement_List (&more_unit->subprogram_body.statements);
+        Symbol_Manager_Pop_Scope ();
+      } else {
+        Resolve_Declaration (more_unit);
+        if (Loaded_Body_Count < 128 and not Body_Already_Loaded (name)) {
+          Mark_Body_Loaded (name);
+          Loaded_Package_Bodies[Loaded_Body_Count++] = more_cu;
+        }
+      }
+    } else if (more_unit->kind == NK_PACKAGE_BODY) {
+      String_Slice body_name = more_unit->package_body.name;
+      Symbol *pkg_sym = body_name.data ? Symbol_Find (body_name) : NULL;
+      if (pkg_sym and pkg_sym->kind == SYMBOL_GENERIC) {
+        pkg_sym->generic_body = more_unit;
+        more_unit->symbol = pkg_sym;
+      }
+    } else {
+      break;
+    }
+  }
 
   // Also try to load the package body if available.
   // Skip if a precompiled .ll file exists (package provided externally).
