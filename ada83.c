@@ -2550,6 +2550,19 @@ LLVM_I1  Generate_Array_Equality      (LLVM_Value   left_ptr,
 LLVM_I1  Generate_Record_Equality     (uint32_t     left_ptr,
                                        uint32_t     right_ptr,
                                        Type_Info   *t);
+uint32_t Emit_Flattened_Array_Size    (uint32_t     bounds_ptr,
+                                       uint32_t     ndim,
+                                       uint32_t     elem_size,
+                                       LLVM_Rep     bt);
+void     Emit_Record_Component_Default (Component_Info *comp,
+                                       uint32_t     comp_ptr,
+                                       uint32_t     val,
+                                       LLVM_Value   val_v);
+void     Emit_Alloc_Bound_Check_Dim   (Type_Info   *tgt_des,
+                                       uint32_t     dim,
+                                       uint32_t     actual_lo,
+                                       uint32_t     actual_hi,
+                                       LLVM_Rep     new_bt);
 
 uint32_t Normalize_To_Fat_Pointer (Syntax_Node *expr,
                                    uint32_t     raw,
@@ -16618,6 +16631,23 @@ String_Slice Mangle_Qualified_Name (String_Slice parent, String_Slice name) {
 // properly-scoped instance symbols (qualified names, correct frame_offset).                       
 // Returns NULL if no match is found.                                                              
 //                                                                                                  
+// True if a scope entry is the instance counterpart of template_sym: same kind,
+// same case-insensitive name, owned by the given instance.
+static bool Instance_Local_Matches (Symbol *candidate, const Symbol *template_sym,
+                                    Symbol *inst) {
+  if (not candidate or candidate->kind != template_sym->kind) return false;
+  if (candidate->name.length != template_sym->name.length) return false;
+  if (candidate->parent != inst) return false;
+  for (uint32_t j = 0; j < candidate->name.length; j++) {
+    char left_ch  = candidate->name.data[j];
+    char right_ch = template_sym->name.data[j];
+    if (left_ch  >= 'A' and left_ch  <= 'Z') left_ch  = left_ch  - 'A' + 'a';
+    if (right_ch >= 'A' and right_ch <= 'Z') right_ch = right_ch - 'A' + 'a';
+    if (left_ch != right_ch) return false;
+  }
+  return true;
+}
+
 Symbol *Find_Instance_Local (const Symbol *template_sym) {
   if (not cg->current_instance or not cg->current_function or
     not cg->current_function->scope)
@@ -16631,38 +16661,14 @@ Symbol *Find_Instance_Local (const Symbol *template_sym) {
     inst = inst->parent;
   }
   Scope *scope = cg->current_function->scope;
-  for (uint32_t i = 0; i < scope->symbol_count; i++) {
-    Symbol *candidate = scope->symbols[i];
-    if (not candidate or candidate->kind != template_sym->kind) continue;
-    if (candidate->name.length != template_sym->name.length) continue;
-    if (candidate->parent != inst) continue;
-    bool match = true;
-    for (uint32_t j = 0; j < candidate->name.length; j++) {
-      char left_ch  = candidate->name.data[j];
-      char right_ch = template_sym->name.data[j];
-      if (left_ch  >= 'A' and left_ch  <= 'Z') left_ch  = left_ch  - 'A' + 'a';
-      if (right_ch >= 'A' and right_ch <= 'Z') right_ch = right_ch - 'A' + 'a';
-      if (left_ch != right_ch) { match = false; break; }
-    }
-    if (match) return candidate;
-  }
+  for (uint32_t i = 0; i < scope->symbol_count; i++)
+    if (Instance_Local_Matches (scope->symbols[i], template_sym, inst))
+      return scope->symbols[i];
 
   // Also check frame_vars (for symbols from child scopes)
-  for (uint32_t i = 0; i < scope->frame_var_count; i++) {
-    Symbol *candidate = scope->frame_vars[i];
-    if (not candidate or candidate->kind != template_sym->kind) continue;
-    if (candidate->name.length != template_sym->name.length) continue;
-    if (candidate->parent != inst) continue;
-    bool match = true;
-    for (uint32_t j = 0; j < candidate->name.length; j++) {
-      char left_ch  = candidate->name.data[j];
-      char right_ch = template_sym->name.data[j];
-      if (left_ch  >= 'A' and left_ch  <= 'Z') left_ch  = left_ch  - 'A' + 'a';
-      if (right_ch >= 'A' and right_ch <= 'Z') right_ch = right_ch - 'A' + 'a';
-      if (left_ch != right_ch) { match = false; break; }
-    }
-    if (match) return candidate;
-  }
+  for (uint32_t i = 0; i < scope->frame_var_count; i++)
+    if (Instance_Local_Matches (scope->frame_vars[i], template_sym, inst))
+      return scope->frame_vars[i];
   return NULL;
 }
 
@@ -29238,6 +29244,165 @@ LLVM_Value Generate_Qualified (Syntax_Node *node) {
   // Callers use Emit_Convert at use sites.
   return result;
 }
+// Flattened element-count*element-size for a (possibly multi-dimensional)
+// array, computed from its runtime bounds array: product over dimensions of
+// max(0, high-low+1), times the element size. `bounds_ptr` addresses low/high
+// pairs (dimension d at indices d*2 and d*2+1). Returns a temp at `bt` width.
+uint32_t Emit_Flattened_Array_Size (uint32_t bounds_ptr, uint32_t ndim,
+                                    uint32_t elem_size, LLVM_Rep bt) {
+  uint32_t tsz = Emit_Temp ();
+  Emit ("  %%t%u = add %s 0, %u\n", tsz, LLVM_Rep_To_String (bt), elem_size);
+  for (uint32_t d = 0; d < ndim; d++) {
+    uint32_t lp = Emit_Temp ();
+    Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
+       lp, LLVM_Rep_To_String (bt), bounds_ptr, d * 2);
+    uint32_t lo = Emit_Temp ();
+    Emit ("  %%t%u = load %s, ptr %%t%u\n", lo, LLVM_Rep_To_String (bt), lp);
+    uint32_t hp = Emit_Temp ();
+    Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
+       hp, LLVM_Rep_To_String (bt), bounds_ptr, d * 2 + 1);
+    uint32_t hi = Emit_Temp ();
+    Emit ("  %%t%u = load %s, ptr %%t%u\n", hi, LLVM_Rep_To_String (bt), hp);
+    uint32_t cnt = Emit_Temp ();
+    Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cnt, LLVM_Rep_To_String (bt), hi, lo);
+    uint32_t c1 = Emit_Temp ();
+    Emit ("  %%t%u = add %s %%t%u, 1\n", c1, LLVM_Rep_To_String (bt), cnt);
+    uint32_t neg = Emit_Temp ();
+    Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, LLVM_Rep_To_String (bt), c1);
+    uint32_t cl = Emit_Temp ();
+    Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n",
+       cl, neg, LLVM_Rep_To_String (bt), LLVM_Rep_To_String (bt), c1);
+    uint32_t nt = Emit_Temp ();
+    Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", nt, LLVM_Rep_To_String (bt), tsz, cl);
+    tsz = nt;
+  }
+  return tsz;
+}
+
+// Store a record component's default value into comp_ptr (RM 3.7). Single
+// source of truth shared by allocator and object-declaration init. Handles:
+//   - fixed/rt-size composite: memcpy (extracting fat-pointer data first)
+//   - dynamic disc-dependent composite array: flatten bounds -> size -> memcpy
+//   - scalar/fixed/float: convert and store
+void Emit_Record_Component_Default (Component_Info *comp, uint32_t comp_ptr,
+                                    uint32_t val, LLVM_Value val_v) {
+  Type_Info *comp_type = comp->component_type;
+  bool comp_is_composite = Type_Is_Composite (comp_type);
+  bool has_rt_size = comp_type and comp_type->rt_global_id > 0;
+  if (comp_is_composite and (comp_type->size > 0 or has_rt_size)) {
+    uint32_t data_ptr = val;
+    bool is_fat_agg = comp->default_expr->kind == NK_AGGREGATE and
+      comp_type and Type_Is_Array_Like (comp_type) and
+      (Type_Is_Unconstrained_Array (comp_type) or
+       Aggregate_Produces_Fat_Pointer (comp_type));
+    if (is_fat_agg) {
+      uint32_t loaded = Emit_Temp ();
+      Emit ("  %%t%u = load " FAT_PTR_TYPE ", ptr %%t%u\n",
+         loaded, val);
+      data_ptr = Emit_Temp ();
+      Emit ("  %%t%u = extractvalue " FAT_PTR_TYPE
+         " %%t%u, 0\n", data_ptr, loaded);
+    }
+    if (has_rt_size) {
+      uint32_t rtsz = Emit_Temp ();
+      Emit ("  %%t%u = load " RT_DESC_TYPE ", ptr @__rt_type_%u_size\n",
+         rtsz, comp_type->rt_global_id);
+      Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %%t%u, i1 false)"
+         "  ; %.*s rt default memcpy\n",
+         comp_ptr, data_ptr, rtsz,
+         (int)comp->name.length, comp->name.data);
+    } else {
+      Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %u, i1 false)"
+         "  ; %.*s default memcpy\n",
+         comp_ptr, data_ptr, comp_type->size,
+         (int)comp->name.length, comp->name.data);
+    }
+
+  // Dynamic-size composite (disc-dependent array): extract data from the
+  // fat-pointer aggregate, compute byte size from bounds, and memcpy.
+  } else if (comp_is_composite) {
+    bool is_fat_agg = comp->default_expr->kind == NK_AGGREGATE and
+      comp_type and Type_Is_Array_Like (comp_type) and
+      (Type_Is_Unconstrained_Array (comp_type) or
+       Aggregate_Produces_Fat_Pointer (comp_type));
+    if (is_fat_agg) {
+      // val is the SSA fat pointer { ptr, ptr } from the aggregate.
+      uint32_t data_ptr = Emit_Temp ();
+      Emit ("  %%t%u = extractvalue " FAT_PTR_TYPE " %%t%u, 0\n",
+         data_ptr, val);
+      uint32_t bnds = Emit_Temp ();
+      Emit ("  %%t%u = extractvalue " FAT_PTR_TYPE " %%t%u, 1\n",
+         bnds, val);
+      uint32_t ndim = comp_type->array.index_count;
+      uint32_t esz = (comp_type->array.element_type and
+        comp_type->array.element_type->size > 0)
+        ? comp_type->array.element_type->size : 4;
+      LLVM_Rep bt = Array_Bound_LLVM_Rep (comp_type);
+      uint32_t tsz = Emit_Flattened_Array_Size (bnds, ndim, esz, bt);
+      uint32_t sz64 = tsz;
+      if (LLVM_Rep_Bits (bt) != 64) {
+        sz64 = Emit_Temp ();
+        Emit ("  %%t%u = sext %s %%t%u to i64\n", sz64, LLVM_Rep_To_String (bt), tsz);
+      }
+      Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %%t%u, i1 false)"
+         "  ; %.*s dynamic default memcpy\n",
+         comp_ptr, data_ptr, sz64,
+         (int)comp->name.length, comp->name.data);
+    }
+  } else {
+    LLVM_Rep store_type = Type_To_Rep (comp_type);
+    LLVM_Rep val_type = val_v.rep;
+    if (val_type.kind == LL_VOID) {
+      Type_Info *expr_type = comp->default_expr->type;
+      if (expr_type) val_type = Type_To_Rep (expr_type);
+    }
+    if (val_type.kind == LL_VOID)
+      val_type = Expression_LLVM_Rep (comp->default_expr);
+    if (store_type.kind == LL_VOID)
+      store_type = val_type;
+    if (Type_Is_Float (comp_type)) {
+      LLVM_Rep flt_ty = Float_LLVM_Rep_Of (comp_type);
+      val = Emit_Convert (val, val_type, flt_ty).reg;
+      Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (flt_ty), val, comp_ptr);
+    } else {
+      if (comp_type and comp_type->kind == TYPE_FIXED and
+        LLVM_Rep_Is_Float (val_type)) {
+        double small = comp_type->fixed.small;
+        if (small <= 0) small = comp_type->fixed.delta > 0 ? comp_type->fixed.delta : 1.0;
+        uint64_t sb; memcpy (&sb, &small, sizeof (sb));
+        uint32_t st = Emit_Temp ();
+        Emit ("  %%t%u = fadd double 0.0, 0x%016llX  ; small\n", st, (unsigned long long)sb);
+        uint32_t dv = Emit_Temp ();
+        Emit ("  %%t%u = fdiv %s %%t%u, %%t%u  ; rec default/small\n", dv, LLVM_Rep_To_String (val_type), val, st);
+        val = dv;
+      }
+      val = Emit_Convert (val, val_type, store_type).reg;
+      Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (store_type), val, comp_ptr);
+    }
+  }
+}
+
+// RM 4.8(6): check one allocated array dimension's actual bounds against the
+// target access type's declared index bounds, raising CONSTRAINT_ERROR on
+// mismatch. No-op when the target bounds are not statically known.
+void Emit_Alloc_Bound_Check_Dim (Type_Info *tgt_des, uint32_t dim,
+                                 uint32_t actual_lo, uint32_t actual_hi,
+                                 LLVM_Rep new_bt) {
+  uint32_t elo = Emit_Type_Bound (&tgt_des->array.indices[dim].low_bound, new_bt);
+  uint32_t ehi = Emit_Type_Bound (&tgt_des->array.indices[dim].high_bound, new_bt);
+  if (elo == 0 or ehi == 0) return;
+  uint32_t clo = Emit_Temp ();
+  Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
+     clo, LLVM_Rep_To_String (new_bt), actual_lo, elo);
+  Emit_Check_With_Raise (clo, true,
+    "alloc fat array lo bound (RM 4.8)");
+  uint32_t chi = Emit_Temp ();
+  Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
+     chi, LLVM_Rep_To_String (new_bt), actual_hi, ehi);
+  Emit_Check_With_Raise (chi, true,
+    "alloc fat array hi bound (RM 4.8)");
+}
+
 LLVM_Value Generate_Allocator (Syntax_Node *node) {
 
   // new T or new T'(value)
@@ -29492,23 +29657,8 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
             tgt_des->array.is_constrained and tgt_des->array.index_count > 0) {
             uint32_t ck = (tgt_des->array.index_count < ndims) ?
                     tgt_des->array.index_count : ndims;
-            for (uint32_t d = 0; d < ck and d < 8; d++) {
-              uint32_t elo = Emit_Type_Bound (
-                &tgt_des->array.indices[d].low_bound, new_bt);
-              uint32_t ehi = Emit_Type_Bound (
-                &tgt_des->array.indices[d].high_bound, new_bt);
-              if (elo == 0 or ehi == 0) continue;
-              uint32_t clo = Emit_Temp ();
-              Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-                 clo, LLVM_Rep_To_String (new_bt), low_ts[d], elo);
-              Emit_Check_With_Raise (clo, true,
-                "alloc fat array lo bound (RM 4.8)");
-              uint32_t chi = Emit_Temp ();
-              Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-                 chi, LLVM_Rep_To_String (new_bt), high_ts[d], ehi);
-              Emit_Check_With_Raise (chi, true,
-                "alloc fat array hi bound (RM 4.8)");
-            }
+            for (uint32_t d = 0; d < ck and d < 8; d++)
+              Emit_Alloc_Bound_Check_Dim (tgt_des, d, low_ts[d], high_ts[d], new_bt);
           }
         }
         // Build fat pointer directly using multi-dim heap bounds
@@ -29530,22 +29680,7 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
                     tgt->access.designated_type : NULL;
         if (tgt_des and Type_Is_Array_Like (tgt_des) and
           tgt_des->array.is_constrained and tgt_des->array.index_count > 0) {
-          uint32_t elo = Emit_Type_Bound (
-            &tgt_des->array.indices[0].low_bound, new_bt);
-          uint32_t ehi = Emit_Type_Bound (
-            &tgt_des->array.indices[0].high_bound, new_bt);
-          if (elo and ehi) {
-            uint32_t clo = Emit_Temp ();
-            Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-               clo, LLVM_Rep_To_String (new_bt), low_ts[0], elo);
-            Emit_Check_With_Raise (clo, true,
-              "alloc fat array lo bound (RM 4.8)");
-            uint32_t chi = Emit_Temp ();
-            Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-               chi, LLVM_Rep_To_String (new_bt), high_ts[0], ehi);
-            Emit_Check_With_Raise (chi, true,
-              "alloc fat array hi bound (RM 4.8)");
-          }
+          Emit_Alloc_Bound_Check_Dim (tgt_des, 0, low_ts[0], high_ts[0], new_bt);
         }
       }
       return Emit_Fat_Pointer_Heap (heap_ptr, low_ts[0], high_ts[0], new_bt);
@@ -29773,125 +29908,7 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
           }
         }
       }
-      Type_Info *comp_type = comp->component_type;
-      bool comp_is_composite = Type_Is_Composite (comp_type);
-      bool has_rt_sz = comp_type and comp_type->rt_global_id > 0;
-      if (comp_is_composite and (comp_type->size > 0 or has_rt_sz)) {
-        uint32_t data_ptr = val;
-        bool is_fat_agg = comp->default_expr->kind == NK_AGGREGATE and
-          comp_type and Type_Is_Array_Like (comp_type) and
-          (Type_Is_Unconstrained_Array (comp_type) or
-           Aggregate_Produces_Fat_Pointer (comp_type));
-        if (is_fat_agg) {
-          uint32_t loaded = Emit_Temp ();
-          Emit ("  %%t%u = load " FAT_PTR_TYPE ", ptr %%t%u\n",
-             loaded, val);
-          data_ptr = Emit_Temp ();
-          Emit ("  %%t%u = extractvalue " FAT_PTR_TYPE
-             " %%t%u, 0\n", data_ptr, loaded);
-        }
-        if (has_rt_sz) {
-          uint32_t rtsz = Emit_Temp ();
-          Emit ("  %%t%u = load " RT_DESC_TYPE ", ptr @__rt_type_%u_size\n",
-             rtsz, comp_type->rt_global_id);
-          Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %%t%u, i1 false)"
-             "  ; %.*s rt default memcpy\n",
-             comp_ptr, data_ptr, rtsz,
-             (int)comp->name.length, comp->name.data);
-        } else {
-          Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %u, i1 false)"
-             "  ; %.*s default memcpy\n",
-             comp_ptr, data_ptr, comp_type->size,
-             (int)comp->name.length, comp->name.data);
-        }
-
-      // Dynamic-size composite (disc-dependent array in NEW):
-      // extract data from fat-pointer aggregate and memcpy.
-      } else if (comp_is_composite) {
-        bool is_fat_agg = comp->default_expr->kind == NK_AGGREGATE and
-          comp_type and Type_Is_Array_Like (comp_type) and
-          (Type_Is_Unconstrained_Array (comp_type) or
-           Aggregate_Produces_Fat_Pointer (comp_type));
-        if (is_fat_agg) {
-          // val is the SSA fat pointer { ptr, ptr } from the aggregate.
-          uint32_t data_ptr = Emit_Temp ();
-          Emit ("  %%t%u = extractvalue " FAT_PTR_TYPE " %%t%u, 0\n",
-             data_ptr, val);
-          uint32_t bnds = Emit_Temp ();
-          Emit ("  %%t%u = extractvalue " FAT_PTR_TYPE " %%t%u, 1\n",
-             bnds, val);
-          uint32_t ndim = comp_type->array.index_count;
-          uint32_t esz = (comp_type->array.element_type and
-            comp_type->array.element_type->size > 0)
-            ? comp_type->array.element_type->size : 4;
-          LLVM_Rep bt = Array_Bound_LLVM_Rep (comp_type);
-          uint32_t tsz = Emit_Temp ();
-          Emit ("  %%t%u = add %s 0, %u\n", tsz, LLVM_Rep_To_String (bt), esz);
-          for (uint32_t d = 0; d < ndim; d++) {
-            uint32_t lp = Emit_Temp ();
-            Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-               lp, LLVM_Rep_To_String (bt), bnds, d * 2);
-            uint32_t lo = Emit_Temp ();
-            Emit ("  %%t%u = load %s, ptr %%t%u\n", lo, LLVM_Rep_To_String (bt), lp);
-            uint32_t hp = Emit_Temp ();
-            Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-               hp, LLVM_Rep_To_String (bt), bnds, d * 2 + 1);
-            uint32_t hi = Emit_Temp ();
-            Emit ("  %%t%u = load %s, ptr %%t%u\n", hi, LLVM_Rep_To_String (bt), hp);
-            uint32_t cnt = Emit_Temp ();
-            Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cnt, LLVM_Rep_To_String (bt), hi, lo);
-            uint32_t c1 = Emit_Temp ();
-            Emit ("  %%t%u = add %s %%t%u, 1\n", c1, LLVM_Rep_To_String (bt), cnt);
-            uint32_t neg = Emit_Temp ();
-            Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, LLVM_Rep_To_String (bt), c1);
-            uint32_t cl = Emit_Temp ();
-            Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n",
-               cl, neg, LLVM_Rep_To_String (bt), LLVM_Rep_To_String (bt), c1);
-            uint32_t nt = Emit_Temp ();
-            Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", nt, LLVM_Rep_To_String (bt), tsz, cl);
-            tsz = nt;
-          }
-          uint32_t sz64 = tsz;
-          if (LLVM_Rep_Bits (bt) != 64) {
-            sz64 = Emit_Temp ();
-            Emit ("  %%t%u = sext %s %%t%u to i64\n", sz64, LLVM_Rep_To_String (bt), tsz);
-          }
-          Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %%t%u, i1 false)"
-             "  ; %.*s dynamic default memcpy\n",
-             comp_ptr, data_ptr, sz64,
-             (int)comp->name.length, comp->name.data);
-        }
-      } else {
-        LLVM_Rep store_type = Type_To_Rep (comp_type);
-        LLVM_Rep val_type = val_v.rep;
-        if (val_type.kind == LL_VOID) {
-          Type_Info *expr_type = comp->default_expr->type;
-          if (expr_type) val_type = Type_To_Rep (expr_type);
-        }
-        if (val_type.kind == LL_VOID)
-          val_type = Expression_LLVM_Rep (comp->default_expr);
-        if (store_type.kind == LL_VOID)
-          store_type = val_type;
-        if (Type_Is_Float (comp_type)) {
-          LLVM_Rep flt_ty = Float_LLVM_Rep_Of (comp_type);
-          val = Emit_Convert (val, val_type, flt_ty).reg;
-          Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (flt_ty), val, comp_ptr);
-        } else {
-          if (comp_type and comp_type->kind == TYPE_FIXED and
-            LLVM_Rep_Is_Float (val_type)) {
-            double small = comp_type->fixed.small;
-            if (small <= 0) small = comp_type->fixed.delta > 0 ? comp_type->fixed.delta : 1.0;
-            uint64_t sb; memcpy (&sb, &small, sizeof (sb));
-            uint32_t st = Emit_Temp ();
-            Emit ("  %%t%u = fadd double 0.0, 0x%016llX  ; small\n", st, (unsigned long long)sb);
-            uint32_t dv = Emit_Temp ();
-            Emit ("  %%t%u = fdiv %s %%t%u, %%t%u  ; rec default/small\n", dv, LLVM_Rep_To_String (val_type), val, st);
-            val = dv;
-          }
-          val = Emit_Convert (val, val_type, store_type).reg;
-          Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (store_type), val, comp_ptr);
-        }
-      }
+      Emit_Record_Component_Default (comp, comp_ptr, val, val_v);
     }
     // Clean up disc_agg_temp from default disc processing
     for (uint32_t i = 0; i < default_disc_cnt; i++)
@@ -35650,133 +35667,7 @@ obj_decl_init:
 
           // Store default value into component, handling composites
           // (arrays/records) with memcpy instead of scalar store.
-          Type_Info *comp_type = comp->component_type;
-          bool comp_is_composite = Type_Is_Composite (comp_type);
-          bool has_rt_size = comp_type and comp_type->rt_global_id > 0;
-
-          // Composite default: expression returns a data pointer.                                 
-          // For dynamic-bound aggregates that produce fat pointers,                                
-          // extract the data pointer first.                                                       
-          //                                                                                        
-          if (comp_is_composite and (comp_type->size > 0 or has_rt_size)) {
-            uint32_t data_ptr = val;
-            bool is_fat_agg = comp->default_expr->kind == NK_AGGREGATE and
-              comp_type and Type_Is_Array_Like (comp_type) and
-              (Type_Is_Unconstrained_Array (comp_type) or
-               Aggregate_Produces_Fat_Pointer (comp_type));
-            if (is_fat_agg) {
-              uint32_t loaded = Emit_Temp ();
-              Emit ("  %%t%u = load " FAT_PTR_TYPE ", ptr %%t%u\n",
-                 loaded, val);
-              data_ptr = Emit_Temp ();
-              Emit ("  %%t%u = extractvalue " FAT_PTR_TYPE
-                 " %%t%u, 0\n", data_ptr, loaded);
-            }
-            if (has_rt_size) {
-              uint32_t rtsz = Emit_Temp ();
-              Emit ("  %%t%u = load " RT_DESC_TYPE ", ptr @__rt_type_%u_size\n",
-                 rtsz, comp_type->rt_global_id);
-              Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %%t%u, i1 false)"
-                 "  ; %.*s rt default memcpy\n",
-                 comp_ptr, data_ptr, rtsz,
-                 (int)comp->name.length, comp->name.data);
-            } else {
-              Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %u, i1 false)"
-                 "  ; %.*s default memcpy\n",
-                 comp_ptr, data_ptr, comp_type->size,
-                 (int)comp->name.length, comp->name.data);
-            }
-
-          // Dynamic-size composite (disc-dependent array):                                         
-          // extract data from fat-pointer aggregate, compute                                       
-          // byte size from bounds, and memcpy.                                                    
-          //                                                                                        
-          } else if (comp_is_composite) {
-            bool is_fat_agg = comp->default_expr->kind == NK_AGGREGATE and
-              comp_type and Type_Is_Array_Like (comp_type) and
-              (Type_Is_Unconstrained_Array (comp_type) or
-               Aggregate_Produces_Fat_Pointer (comp_type));
-            if (is_fat_agg) {
-              // val is the SSA fat pointer { ptr, ptr } from the aggregate.
-              uint32_t data_ptr = Emit_Temp ();
-              Emit ("  %%t%u = extractvalue " FAT_PTR_TYPE " %%t%u, 0\n",
-                 data_ptr, val);
-              uint32_t bnds = Emit_Temp ();
-              Emit ("  %%t%u = extractvalue " FAT_PTR_TYPE " %%t%u, 1\n",
-                 bnds, val);
-              uint32_t ndim = comp_type->array.index_count;
-              uint32_t esz = (comp_type->array.element_type and
-                comp_type->array.element_type->size > 0)
-                ? comp_type->array.element_type->size : 4;
-              LLVM_Rep bt = Array_Bound_LLVM_Rep (comp_type);
-              uint32_t tsz = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %u\n", tsz, LLVM_Rep_To_String (bt), esz);
-              for (uint32_t d = 0; d < ndim; d++) {
-                uint32_t lp = Emit_Temp ();
-                Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-                   lp, LLVM_Rep_To_String (bt), bnds, d * 2);
-                uint32_t lo = Emit_Temp ();
-                Emit ("  %%t%u = load %s, ptr %%t%u\n", lo, LLVM_Rep_To_String (bt), lp);
-                uint32_t hp = Emit_Temp ();
-                Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-                   hp, LLVM_Rep_To_String (bt), bnds, d * 2 + 1);
-                uint32_t hi = Emit_Temp ();
-                Emit ("  %%t%u = load %s, ptr %%t%u\n", hi, LLVM_Rep_To_String (bt), hp);
-                uint32_t cnt = Emit_Temp ();
-                Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cnt, LLVM_Rep_To_String (bt), hi, lo);
-                uint32_t c1 = Emit_Temp ();
-                Emit ("  %%t%u = add %s %%t%u, 1\n", c1, LLVM_Rep_To_String (bt), cnt);
-                uint32_t neg = Emit_Temp ();
-                Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, LLVM_Rep_To_String (bt), c1);
-                uint32_t cl = Emit_Temp ();
-                Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n",
-                   cl, neg, LLVM_Rep_To_String (bt), LLVM_Rep_To_String (bt), c1);
-                uint32_t nt = Emit_Temp ();
-                Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", nt, LLVM_Rep_To_String (bt), tsz, cl);
-                tsz = nt;
-              }
-              uint32_t sz64 = tsz;
-              if (LLVM_Rep_Bits (bt) != 64) {
-                sz64 = Emit_Temp ();
-                Emit ("  %%t%u = sext %s %%t%u to i64\n", sz64, LLVM_Rep_To_String (bt), tsz);
-              }
-              Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %%t%u, i1 false)"
-                 "  ; %.*s dynamic default memcpy\n",
-                 comp_ptr, data_ptr, sz64,
-                 (int)comp->name.length, comp->name.data);
-            }
-          } else {
-            LLVM_Rep store_type = Type_To_Rep (comp_type);
-            LLVM_Rep val_type = val_v.rep;
-            if (val_type.kind == LL_VOID) {
-              Type_Info *expr_type = comp->default_expr->type;
-              if (expr_type)
-                val_type = Type_To_Rep (expr_type);
-            }
-            if (val_type.kind == LL_VOID)
-              val_type = Expression_LLVM_Rep (comp->default_expr);
-            if (store_type.kind == LL_VOID)
-              store_type = val_type;
-            if (Type_Is_Float (comp_type)) {
-              LLVM_Rep flt_ty = Float_LLVM_Rep_Of (comp_type);
-              val = Emit_Convert (val, val_type, flt_ty).reg;
-              Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (flt_ty), val, comp_ptr);
-            } else {
-              if (comp_type and comp_type->kind == TYPE_FIXED and
-                LLVM_Rep_Is_Float (val_type)) {
-                double small = comp_type->fixed.small;
-                if (small <= 0) small = comp_type->fixed.delta > 0 ? comp_type->fixed.delta : 1.0;
-                uint64_t sb; memcpy (&sb, &small, sizeof (sb));
-                uint32_t st = Emit_Temp ();
-                Emit ("  %%t%u = fadd double 0.0, 0x%016llX  ; small\n", st, (unsigned long long)sb);
-                uint32_t dv = Emit_Temp ();
-                Emit ("  %%t%u = fdiv %s %%t%u, %%t%u  ; rec default/small\n", dv, LLVM_Rep_To_String (val_type), val, st);
-                val = dv;
-              }
-              val = Emit_Convert (val, val_type, store_type).reg;
-              Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (store_type), val, comp_ptr);
-            }
-          }
+          Emit_Record_Component_Default (comp, comp_ptr, val, val_v);
 
           // After storing a discriminant default, set disc_agg_temp on all
           // disc symbols referenced by dependent component array bounds (RM 3.7).
@@ -36004,32 +35895,7 @@ obj_decl_init:
                 sc_type->array.element_type->size > 0)
                 ? sc_type->array.element_type->size : 4;
               LLVM_Rep bt = Array_Bound_LLVM_Rep (sc_type);
-              uint32_t tsz = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %u\n", tsz, LLVM_Rep_To_String (bt), esz);
-              for (uint32_t d = 0; d < ndim; d++) {
-                uint32_t lp = Emit_Temp ();
-                Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-                   lp, LLVM_Rep_To_String (bt), bnds, d * 2);
-                uint32_t lo = Emit_Temp ();
-                Emit ("  %%t%u = load %s, ptr %%t%u\n", lo, LLVM_Rep_To_String (bt), lp);
-                uint32_t hp = Emit_Temp ();
-                Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-                   hp, LLVM_Rep_To_String (bt), bnds, d * 2 + 1);
-                uint32_t hi = Emit_Temp ();
-                Emit ("  %%t%u = load %s, ptr %%t%u\n", hi, LLVM_Rep_To_String (bt), hp);
-                uint32_t cnt = Emit_Temp ();
-                Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cnt, LLVM_Rep_To_String (bt), hi, lo);
-                uint32_t c1 = Emit_Temp ();
-                Emit ("  %%t%u = add %s %%t%u, 1\n", c1, LLVM_Rep_To_String (bt), cnt);
-                uint32_t neg = Emit_Temp ();
-                Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, LLVM_Rep_To_String (bt), c1);
-                uint32_t cl = Emit_Temp ();
-                Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n",
-                   cl, neg, LLVM_Rep_To_String (bt), LLVM_Rep_To_String (bt), c1);
-                uint32_t nt = Emit_Temp ();
-                Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", nt, LLVM_Rep_To_String (bt), tsz, cl);
-                tsz = nt;
-              }
+              uint32_t tsz = Emit_Flattened_Array_Size (bnds, ndim, esz, bt);
               uint32_t sz64 = tsz;
               if (LLVM_Rep_Bits (bt) != 64) {
                 sz64 = Emit_Temp ();
@@ -38564,122 +38430,16 @@ void Generate_Type_Equality_Function (Type_Info *t) {
     if (t->record.component_count == 0) {
       Emit ("  ret i1 1\n");
     } else {
-      LLVM_I1 result = { 0 };
-      for (uint32_t i = 0; i < t->record.component_count; i++) {
-        Component_Info *comp = &t->record.components[i];
-        LLVM_Rep comp_llvm_type = Type_To_Rep (comp->component_type);
 
-        // Get pointers to components
-        uint32_t left_gep = Emit_Temp ();
-        uint32_t right_gep = Emit_Temp ();
-        Emit ("  %%t%u = getelementptr i8, ptr %%0, i64 %u\n",
-           left_gep, comp->byte_offset);
-        Emit ("  %%t%u = getelementptr i8, ptr %%1, i64 %u\n",
-           right_gep, comp->byte_offset);
-
-        // Compare component - handle arrays/strings specially
-        LLVM_I1 cmp;
-        Type_Info *ct = comp->component_type;
-        bool is_fat_ptr_access = Type_Needs_Fat_Pointer (ct);
-        if (Type_Is_Unconstrained_Array (ct) or
-          (not Type_Is_Constrained_Array (ct) and Type_Is_String (ct))) {
-
-          // Unconstrained array/string - load fat pointer values from storage
-          LLVM_Rep eqf_bt = Array_Bound_LLVM_Rep (ct);
-          uint32_t left_fat = Emit_Load_Fat_Pointer_From_Temp (left_gep, eqf_bt).reg;
-          uint32_t right_fat = Emit_Load_Fat_Pointer_From_Temp (right_gep, eqf_bt).reg;
-          cmp = Generate_Array_Equality (Val_Of_Type (left_fat, ct), Val_Of_Type (right_fat, ct), ct);
-
-        // Constrained array with dynamic bounds (discriminant-dependent).
-        // Compute runtime byte size from discriminant value.
-        } else if (Type_Is_Constrained_Array (ct) and Type_Has_Dynamic_Bounds (ct)) {
-          uint32_t elem_size = ct->array.element_type ? ct->array.element_type->size : 1;
-          if (elem_size == 0) elem_size = 1;
-          int64_t low_val = 1;
-          if (ct->array.index_count > 0 and ct->array.indices[0].low_bound.kind == BOUND_INTEGER)
-            low_val = (int64_t)ct->array.indices[0].low_bound.int_value;
-          uint32_t disc_offset = 0;
-          LLVM_Rep disc_llvm = LLVM_Rep_Int (32, false);
-          if (ct->array.index_count > 0 and ct->array.indices[0].high_bound.kind == BOUND_EXPR
-            and ct->array.indices[0].high_bound.expr) {
-            Symbol *bsym = ct->array.indices[0].high_bound.expr->symbol;
-            for (uint32_t d = 0; d < t->record.discriminant_count; d++) {
-              Component_Info *dc = &t->record.components[d];
-              if (bsym and Slice_Equal_Ignore_Case (dc->name, bsym->name)) {
-                disc_offset = dc->byte_offset;
-                disc_llvm = LLVM_Rep_Or (Type_To_Rep (dc->component_type), LLVM_Rep_Int (32, false));
-                break;
-              }
-            }
-          }
-          uint32_t dp = Emit_Temp (), dv = Emit_Temp ();
-          Emit ("  %%t%u = getelementptr i8, ptr %%0, i64 %u\n", dp, disc_offset);
-          Emit ("  %%t%u = load %s, ptr %%t%u\n", dv, LLVM_Rep_To_String (disc_llvm), dp);
-          uint32_t cnt = Emit_Temp ();
-          Emit ("  %%t%u = sub %s %%t%u, %lld\n", cnt, LLVM_Rep_To_String (disc_llvm), dv, (long long)(low_val - 1));
-          if (elem_size > 1) {
-            uint32_t mul = Emit_Temp ();
-            Emit ("  %%t%u = mul %s %%t%u, %u\n", mul, LLVM_Rep_To_String (disc_llvm), cnt, elem_size);
-            cnt = mul;
-          }
-          // TODO: icmp-bool
-          uint32_t is_neg = Emit_Temp (), clamped = Emit_Temp (), sz64 = Emit_Temp ();
-          Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", is_neg, LLVM_Rep_To_String (disc_llvm), cnt);
-          Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n", clamped, is_neg, LLVM_Rep_To_String (disc_llvm), LLVM_Rep_To_String (disc_llvm), cnt);
-          Emit ("  %%t%u = sext %s %%t%u to i64\n", sz64, LLVM_Rep_To_String (disc_llvm), clamped);
-          uint32_t mc_result = Emit_Temp ();
-          // TODO: icmp-bool
-          uint32_t mc_cmp = Emit_Temp ();
-          Emit ("  %%t%u = call " C_INT_TYPE " @memcmp (ptr %%t%u, ptr %%t%u, i64 %%t%u)\n",
-             mc_result, left_gep, right_gep, sz64);
-          Emit ("  %%t%u = icmp eq " C_INT_TYPE " %%t%u, 0\n", mc_cmp, mc_result);
-          cmp = (LLVM_I1){ mc_cmp };
-
-        // Constrained array with static bounds - use array equality
-        } else if (Type_Is_Constrained_Array (ct)) {
-          cmp = Generate_Array_Equality (Val_Of_Type (left_gep, ct), Val_Of_Type (right_gep, ct), ct);
-
-        // Nested record - recurse
-        } else if (Type_Is_Record (ct)) {
-          cmp = Generate_Record_Equality (left_gep, right_gep, ct);
-
-        // ACCESS to unconstrained array - compare fat pointer identity
-        } else if (is_fat_ptr_access) {
-          LLVM_Rep acc_eqf_bt = Array_Bound_LLVM_Rep (ct->access.designated_type);
-          uint32_t left_val = Emit_Load_Fat_Pointer_From_Temp (left_gep, acc_eqf_bt).reg;
-          uint32_t right_val = Emit_Load_Fat_Pointer_From_Temp (right_gep, acc_eqf_bt).reg;
-          cmp = Emit_Fat_Pointer_Compare (left_val, right_val, acc_eqf_bt);
-
-        // Scalar type - load and compare
-        } else {
-          uint32_t left_val = Emit_Temp ();
-          uint32_t right_val = Emit_Temp ();
-          Emit ("  %%t%u = load %s, ptr %%t%u\n",
-             left_val, LLVM_Rep_To_String (comp_llvm_type), left_gep);
-          Emit ("  %%t%u = load %s, ptr %%t%u\n",
-             right_val, LLVM_Rep_To_String (comp_llvm_type), right_gep);
-          // TODO: icmp-bool
-          uint32_t cmp_reg = Emit_Temp ();
-          if (Type_Is_Float_Representation (ct)) {
-            Emit ("  %%t%u = fcmp oeq %s %%t%u, %%t%u\n",
-               cmp_reg, LLVM_Rep_To_String (comp_llvm_type), left_val, right_val);
-          } else {
-            Emit ("  %%t%u = icmp eq %s %%t%u, %%t%u\n",
-               cmp_reg, LLVM_Rep_To_String (comp_llvm_type), left_val, right_val);
-          }
-          cmp = (LLVM_I1){ cmp_reg };
-        }
-
-        // AND with previous results
-        if (i == 0) {
-          result = cmp;
-        } else {
-          uint32_t and_result = Emit_Temp ();
-          Emit ("  %%t%u = and i1 %%t%u, %%t%u\n",
-             and_result, result.reg, cmp.reg);
-          result = (LLVM_I1){ and_result };
-        }
-      }
+      // Per-component record equality is a single algorithm. Materialize the
+      // two pointer parameters as temps and delegate to Generate_Record_Equality
+      // (the recursive source of truth) instead of carrying a second copy of the
+      // component-type dispatch here.
+      uint32_t left_base  = Emit_Temp ();
+      uint32_t right_base = Emit_Temp ();
+      Emit ("  %%t%u = getelementptr i8, ptr %%0, i64 0\n", left_base);
+      Emit ("  %%t%u = getelementptr i8, ptr %%1, i64 0\n", right_base);
+      LLVM_I1 result = Generate_Record_Equality (left_base, right_base, t);
       Emit ("  ret i1 %%t%u\n", result.reg);
     }
   } else if (Type_Is_Array_Like (t)) {
