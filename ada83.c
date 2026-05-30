@@ -2313,6 +2313,7 @@ void Emit_Range_Check_With_Raise (uint32_t    val,
 LLVM_Value Emit_Overflow_Checked_Op (uint32_t    left,
                                      uint32_t    right,
                                      const char *op,
+                                     LLVM_Rep    op_rep,
                                      Type_Info  *result_type);
 
 // ???
@@ -17047,17 +17048,17 @@ void Emit_Raise_Exception (const char *exc_name, const char *comment) {
 LLVM_Value Emit_Overflow_Checked_Op (
   uint32_t left, uint32_t right,
   const char *op,  // "add", "sub", "mul"
+  LLVM_Rep    op_rep,  // width to perform the operation at (operands already at this width)
   Type_Info *result_type)
 {
-  LLVM_Rep    rep        = Type_To_Rep (result_type);
-  LLVM_Rep llvm_type = rep;
+  LLVM_Rep llvm_type = op_rep;
   bool        is_unsigned = Type_Is_Unsigned (result_type);
   bool        suppressed = Check_Is_Suppressed (result_type, NULL, CHK_OVERFLOW);
 
   // Plain operation (wraps for modular, or check suppressed)
   if (is_unsigned or suppressed) {
     uint32_t t = Emit_Temp ();
-    Emit ("  %%t%u = %s %s %%t%u, %%t%u\n", t, op, llvm_type, left, right);
+    Emit ("  %%t%u = %s %s %%t%u, %%t%u\n", t, op, LLVM_Rep_To_String (llvm_type), left, right);
 
     // Modular non-power-of-2: caller handles urem wrapping
     return Val_Of_Type (t, result_type);
@@ -17072,20 +17073,20 @@ LLVM_Value Emit_Overflow_Checked_Op (
 
     // No intrinsic for div/rem - fall back to plain
     uint32_t t = Emit_Temp ();
-    Emit ("  %%t%u = %s %s %%t%u, %%t%u\n", t, op, llvm_type, left, right);
+    Emit ("  %%t%u = %s %s %%t%u, %%t%u\n", t, op, LLVM_Rep_To_String (llvm_type), left, right);
     return Val_Of_Type (t, result_type);
   }
 
   // Emit: %pair = call {iN, i1} @llvm.sOP.with.overflow.iN(iN %left, iN %right)
   uint32_t pair = Emit_Temp ();
   Emit ("  %%t%u = call {%s, i1} @llvm.%s.with.overflow.%s(%s %%t%u, %s %%t%u)\n",
-     pair, llvm_type, intrinsic_op, llvm_type, llvm_type, left, llvm_type, right);
+     pair, LLVM_Rep_To_String (llvm_type), intrinsic_op, LLVM_Rep_To_String (llvm_type), LLVM_Rep_To_String (llvm_type), left, LLVM_Rep_To_String (llvm_type), right);
 
   // Extract result and overflow flag
   uint32_t result = Emit_Temp ();
-  Emit ("  %%t%u = extractvalue {%s, i1} %%t%u, 0\n", result, llvm_type, pair);
+  Emit ("  %%t%u = extractvalue {%s, i1} %%t%u, 0\n", result, LLVM_Rep_To_String (llvm_type), pair);
   uint32_t ovf = Emit_Temp ();
-  Emit ("  %%t%u = extractvalue {%s, i1} %%t%u, 1\n", ovf, llvm_type, pair);
+  Emit ("  %%t%u = extractvalue {%s, i1} %%t%u, 1\n", ovf, LLVM_Rep_To_String (llvm_type), pair);
 
   // Branch on overflow
   Emit_Check_With_Raise (ovf, true, "arithmetic overflow");
@@ -17166,11 +17167,11 @@ uint32_t Emit_Index_Check (LLVM_Value index_v,
 
   // index < low?
   uint32_t cmp_lo = Emit_Temp ();
-  Emit ("  %%t%u = icmp %s %s %%t%u, %%t%u\n", cmp_lo, lt, index_str, index, low_bound);
+  Emit ("  %%t%u = icmp %s %s %%t%u, %%t%u\n", cmp_lo, lt, LLVM_Rep_To_String (index_str), index, low_bound);
 
   // index > high?
   uint32_t cmp_hi = Emit_Temp ();
-  Emit ("  %%t%u = icmp %s %s %%t%u, %%t%u\n", cmp_hi, gt, index_str, index, high_bound);
+  Emit ("  %%t%u = icmp %s %s %%t%u, %%t%u\n", cmp_hi, gt, LLVM_Rep_To_String (index_str), index, high_bound);
   uint32_t out_of_range = Emit_Temp ();
   Emit ("  %%t%u = or i1 %%t%u, %%t%u\n", out_of_range, cmp_lo, cmp_hi);
   Emit_Check_With_Raise (out_of_range, true, "index check failed");
@@ -17494,42 +17495,42 @@ LLVM_Value Emit_Convert_Ext (uint32_t src, LLVM_Rep src_rep,
 
   if (src_is_float and dst_is_float) {
     if (dst_bits > src_bits) {
-      Emit ("  %%t%u = fpext %s %%t%u to %s\n", t, src_s, src, dst_s);
+      Emit ("  %%t%u = fpext %s %%t%u to %s\n", t, LLVM_Rep_To_String (src_s), src, LLVM_Rep_To_String (dst_s));
     } else {
-      Emit ("  %%t%u = fptrunc %s %%t%u to %s\n", t, src_s, src, dst_s);
+      Emit ("  %%t%u = fptrunc %s %%t%u to %s\n", t, LLVM_Rep_To_String (src_s), src, LLVM_Rep_To_String (dst_s));
     }
 
   } else if (src_is_float and dst_is_ptr) {
     uint32_t int_temp = Emit_Temp ();
-    Emit ("  %%t%u = fptosi %s %%t%u to i64\n", int_temp, src_s, src);
+    Emit ("  %%t%u = fptosi %s %%t%u to i64\n", int_temp, LLVM_Rep_To_String (src_s), src);
     Emit ("  %%t%u = inttoptr " PTR_INT_TYPE " %%t%u to ptr\n", t, int_temp);
 
   } else if (src_is_float and not dst_is_ptr) {
     // float → integer (or other non-ptr); fat handled by fall-through below.
     uint32_t rounded = Emit_Temp ();
     Emit ("  %%t%u = call %s @llvm.round.%s(%s %%t%u)\n",
-       rounded, src_s, src_s, src_s, src);
+       rounded, LLVM_Rep_To_String (src_s), LLVM_Rep_To_String (src_s), LLVM_Rep_To_String (src_s), src);
     Emit ("  %%t%u = %s %s %%t%u to %s\n", t,
-       is_unsigned ? "fptoui" : "fptosi", src_s, rounded, dst_s);
+       is_unsigned ? "fptoui" : "fptosi", LLVM_Rep_To_String (src_s), rounded, LLVM_Rep_To_String (dst_s));
 
   } else if (src_is_ptr and dst_is_float) {
     uint32_t int_temp = Emit_Temp ();
     Emit ("  %%t%u = ptrtoint ptr %%t%u to " PTR_INT_TYPE "\n", int_temp, src);
     Emit ("  %%t%u = %s i64 %%t%u to %s\n", t,
-       is_unsigned ? "uitofp" : "sitofp", int_temp, dst_s);
+       is_unsigned ? "uitofp" : "sitofp", int_temp, LLVM_Rep_To_String (dst_s));
 
   } else if (src_is_int and dst_is_float) {
     Emit ("  %%t%u = %s %s %%t%u to %s\n", t,
-       is_unsigned ? "uitofp" : "sitofp", src_s, src, dst_s);
+       is_unsigned ? "uitofp" : "sitofp", LLVM_Rep_To_String (src_s), src, LLVM_Rep_To_String (dst_s));
 
   } else if (src_is_ptr and dst_is_ptr) {
     return Val_Rep (src, src_rep);
 
   } else if (src_is_ptr and dst_is_int) {
-    Emit ("  %%t%u = ptrtoint ptr %%t%u to %s\n", t, src, dst_s);
+    Emit ("  %%t%u = ptrtoint ptr %%t%u to %s\n", t, src, LLVM_Rep_To_String (dst_s));
 
   } else if (src_is_int and dst_is_ptr) {
-    Emit ("  %%t%u = inttoptr %s %%t%u to ptr\n", t, src_s, src);
+    Emit ("  %%t%u = inttoptr %s %%t%u to ptr\n", t, LLVM_Rep_To_String (src_s), src);
 
   } else if (src_is_fat and dst_is_fat) {
     return Val_Rep (src, src_rep);
@@ -17537,7 +17538,7 @@ LLVM_Value Emit_Convert_Ext (uint32_t src, LLVM_Rep src_rep,
   } else if (src_is_fat and dst_is_ptr) {
     // Lose bounds, keep data ptr — used for fat-to-constrained-param passing
     // and assignment to plain access types.
-    Emit ("  %%t%u = extractvalue %s %%t%u, 0\n", t, src_s, src);
+    Emit ("  %%t%u = extractvalue %s %%t%u, 0\n", t, LLVM_Rep_To_String (src_s), src);
 
   } else if (src_is_ptr and dst_is_fat) {
     // Pointer to unconstrained-array storage: load fat value, null-guarded.
@@ -17550,7 +17551,7 @@ LLVM_Value Emit_Convert_Ext (uint32_t src, LLVM_Rep src_rep,
     cg->block_terminated = true;
     Emit_Label_Here (ok_lbl);
     uint32_t loaded = Emit_Temp ();
-    Emit ("  %%t%u = load %s, ptr %%t%u\n", loaded, dst_s, src);
+    Emit ("  %%t%u = load %s, ptr %%t%u\n", loaded, LLVM_Rep_To_String (dst_s), src);
     Emit ("  br label %%L%u\n", merge_lbl);
     cg->block_terminated = true;
     Emit_Label_Here (null_lbl);
@@ -17558,18 +17559,18 @@ LLVM_Value Emit_Convert_Ext (uint32_t src, LLVM_Rep src_rep,
     cg->block_terminated = true;
     Emit_Label_Here (merge_lbl);
     Emit ("  %%t%u = phi %s [ %%t%u, %%L%u ], [ zeroinitializer, %%L%u ]\n",
-       t, dst_s, loaded, ok_lbl, null_lbl);
+       t, LLVM_Rep_To_String (dst_s), loaded, ok_lbl, null_lbl);
     cg->block_terminated = false;
 
   } else if (src_is_fat and dst_is_int) {
     uint32_t data = Emit_Temp ();
-    Emit ("  %%t%u = extractvalue %s %%t%u, 0\n", data, src_s, src);
-    Emit ("  %%t%u = ptrtoint ptr %%t%u to %s\n", t, data, dst_s);
+    Emit ("  %%t%u = extractvalue %s %%t%u, 0\n", data, LLVM_Rep_To_String (src_s), src);
+    Emit ("  %%t%u = ptrtoint ptr %%t%u to %s\n", t, data, LLVM_Rep_To_String (dst_s));
 
   } else if (src_is_int and dst_is_fat) {
     uint32_t ptr_temp = Emit_Temp ();
-    Emit ("  %%t%u = inttoptr %s %%t%u to ptr\n", ptr_temp, src_s, src);
-    Emit ("  %%t%u = load %s, ptr %%t%u\n", t, dst_s, ptr_temp);
+    Emit ("  %%t%u = inttoptr %s %%t%u to ptr\n", ptr_temp, LLVM_Rep_To_String (src_s), src);
+    Emit ("  %%t%u = load %s, ptr %%t%u\n", t, LLVM_Rep_To_String (dst_s), ptr_temp);
 
   } else if (src_is_fat or dst_is_fat) {
     return Val_Rep (src, src_rep);
@@ -17579,11 +17580,11 @@ LLVM_Value Emit_Convert_Ext (uint32_t src, LLVM_Rep src_rep,
     if (dst_bits > src_bits) {
       bool use_zext = (src_bits == 1) or is_unsigned;
       Emit ("  %%t%u = %s %s %%t%u to %s\n", t,
-            use_zext ? "zext" : "sext", src_s, src, dst_s);
+            use_zext ? "zext" : "sext", LLVM_Rep_To_String (src_s), src, LLVM_Rep_To_String (dst_s));
     } else if (dst_bits == 1) {
-      Emit ("  %%t%u = icmp ne %s %%t%u, 0\n", t, src_s, src);
+      Emit ("  %%t%u = icmp ne %s %%t%u, 0\n", t, LLVM_Rep_To_String (src_s), src);
     } else {
-      Emit ("  %%t%u = trunc %s %%t%u to %s\n", t, src_s, src, dst_s);
+      Emit ("  %%t%u = trunc %s %%t%u to %s\n", t, LLVM_Rep_To_String (src_s), src, LLVM_Rep_To_String (dst_s));
     }
 
   } else {
@@ -17767,7 +17768,7 @@ static uint32_t Emit_Constraint_Check_Internal (uint32_t val, LLVM_Rep val_rep,
       lo = Emit_Temp ();
       Emit ("  %%t%u = sitofp %s %s to %s  ; low bound\n",
          lo, LLVM_Rep_To_String (Integer_Arith_Rep ()),
-         I128_Decimal (target->low_bound.int_value), flt_type);
+         I128_Decimal (target->low_bound.int_value), LLVM_Rep_To_String (flt_type));
     } else {
       if (target->low_bound.cached_temp) {
         lo = target->low_bound.cached_temp;
@@ -17796,7 +17797,7 @@ static uint32_t Emit_Constraint_Check_Internal (uint32_t val, LLVM_Rep val_rep,
       hi = Emit_Temp ();
       Emit ("  %%t%u = sitofp %s %s to %s  ; high bound\n",
          hi, LLVM_Rep_To_String (Integer_Arith_Rep ()),
-         I128_Decimal (target->high_bound.int_value), flt_type);
+         I128_Decimal (target->high_bound.int_value), LLVM_Rep_To_String (flt_type));
     } else {
       if (target->high_bound.cached_temp) {
         hi = target->high_bound.cached_temp;
@@ -17810,14 +17811,14 @@ static uint32_t Emit_Constraint_Check_Internal (uint32_t val, LLVM_Rep val_rep,
 
     // val < low?
     uint32_t cmp_lo = Emit_Temp ();
-    Emit ("  %%t%u = fcmp olt %s %%t%u, %%t%u\n", cmp_lo, flt_type, val, lo);
+    Emit ("  %%t%u = fcmp olt %s %%t%u, %%t%u\n", cmp_lo, LLVM_Rep_To_String (flt_type), val, lo);
     Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n", cmp_lo, raise_label, ok_label);
     cg->block_terminated = true;
     Emit_Label_Here (ok_label);
 
     // val > high?
     uint32_t cmp_hi = Emit_Temp ();
-    Emit ("  %%t%u = fcmp ogt %s %%t%u, %%t%u\n", cmp_hi, flt_type, val, hi);
+    Emit ("  %%t%u = fcmp ogt %s %%t%u, %%t%u\n", cmp_hi, LLVM_Rep_To_String (flt_type), val, hi);
     Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n", cmp_hi, raise_label, cont_label);
     cg->block_terminated = true;
 
@@ -17966,14 +17967,14 @@ static uint32_t Emit_Constraint_Check_Internal (uint32_t val, LLVM_Rep val_rep,
     uint32_t wlo  = Emit_Convert_Ext (low_bound,  lo_rep, chk_rep, chk_unsigned).reg;
     uint32_t whi  = Emit_Convert_Ext (high_bound, hi_rep, chk_rep, chk_unsigned).reg;
     uint32_t cmp_lo = Emit_Temp ();
-    Emit ("  %%t%u = icmp %s %s %%t%u, %%t%u\n", cmp_lo, lt_pred, chk_type, wval, wlo);
+    Emit ("  %%t%u = icmp %s %s %%t%u, %%t%u\n", cmp_lo, lt_pred, LLVM_Rep_To_String (chk_type), wval, wlo);
     Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n", cmp_lo, raise_label, ok_label);
     cg->block_terminated = true;
     Emit_Label_Here (ok_label);
 
     // val > high?
     uint32_t cmp_hi = Emit_Temp ();
-    Emit ("  %%t%u = icmp %s %s %%t%u, %%t%u\n", cmp_hi, gt_pred, chk_type, wval, whi);
+    Emit ("  %%t%u = icmp %s %s %%t%u, %%t%u\n", cmp_hi, gt_pred, LLVM_Rep_To_String (chk_type), wval, whi);
     Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n", cmp_hi, raise_label, cont_label);
     cg->block_terminated = true;
   }
@@ -18033,7 +18034,7 @@ void Emit_Subtype_Constraint_Compat_Check (Type_Info *subtype) {
     if (constraint_low_rep.kind == LL_VOID) constraint_low_rep = iat;
     clo = Emit_Convert (clo, constraint_low_rep, iat).reg;
     uint32_t cmp_result = Emit_Temp ();
-    Emit ("  %%t%u = icmp slt %s %%t%u, %%t%u\n", cmp_result, iat_s, clo, blo);
+    Emit ("  %%t%u = icmp slt %s %%t%u, %%t%u\n", cmp_result, LLVM_Rep_To_String (iat_s), clo, blo);
     Emit_Check_With_Raise (cmp_result, true, "subtype low bound");
   }
   if (hi_dyn) {
@@ -18042,7 +18043,7 @@ void Emit_Subtype_Constraint_Compat_Check (Type_Info *subtype) {
     if (constraint_high_rep.kind == LL_VOID) constraint_high_rep = iat;
     chi = Emit_Convert (chi, constraint_high_rep, iat).reg;
     uint32_t cmp_result = Emit_Temp ();
-    Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u\n", cmp_result, iat_s, chi, bhi);
+    Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u\n", cmp_result, LLVM_Rep_To_String (iat_s), chi, bhi);
     Emit_Check_With_Raise (cmp_result, true, "subtype high bound");
   }
 }
@@ -18075,13 +18076,13 @@ LLVM_Value Emit_Fat_Pointer (uint32_t data_ptr,
   uint32_t low_gep = Emit_Temp ();
   Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 0, i32 0\n",
      low_gep, bounds_struct, bounds_alloca);
-  Emit ("  store %s %s, ptr %%t%u\n", bt, I128_Decimal (low), low_gep);
+  Emit ("  store %s %s, ptr %%t%u\n", LLVM_Rep_To_String (bt), I128_Decimal (low), low_gep);
 
   // Store high bound in native bt
   uint32_t high_gep = Emit_Temp ();
   Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 0, i32 1\n",
      high_gep, bounds_struct, bounds_alloca);
-  Emit ("  store %s %s, ptr %%t%u\n", bt, I128_Decimal (high), high_gep);
+  Emit ("  store %s %s, ptr %%t%u\n", LLVM_Rep_To_String (bt), I128_Decimal (high), high_gep);
 
   // Build fat pointer { ptr, ptr } via insertvalue
   uint32_t partial = Emit_Temp ();
@@ -18150,7 +18151,7 @@ LLVM_Value Emit_Fat_Pointer_Bound (uint32_t fat_ptr,
   Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 0, i32 %u\n",
      gep, bounds_struct, bptr, field_index);
   uint32_t val = Emit_Temp ();
-  Emit ("  %%t%u = load %s, ptr %%t%u\n", val, bt, gep);
+  Emit ("  %%t%u = load %s, ptr %%t%u\n", val, LLVM_Rep_To_String (bt), gep);
   return Val_Rep (val, bt);
 }
 #define Emit_Fat_Pointer_Low(fp, bt)  Emit_Fat_Pointer_Bound ((fp), (bt), 0)
@@ -18167,9 +18168,9 @@ LLVM_Value Emit_Fat_Pointer_Low_Dim (uint32_t fat_ptr,
   Emit ("  %%t%u = extractvalue " FAT_PTR_TYPE " %%t%u, 1\n", bptr, fat_ptr);
   uint32_t gep = Emit_Temp ();
   Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-     gep, bt, bptr, dim * 2);
+     gep, LLVM_Rep_To_String (bt), bptr, dim * 2);
   uint32_t val = Emit_Temp ();
-  Emit ("  %%t%u = load %s, ptr %%t%u\n", val, bt, gep);
+  Emit ("  %%t%u = load %s, ptr %%t%u\n", val, LLVM_Rep_To_String (bt), gep);
   return Val_Rep (val, bt);
 }
 LLVM_Value Emit_Fat_Pointer_High_Dim (uint32_t fat_ptr,
@@ -18179,9 +18180,9 @@ LLVM_Value Emit_Fat_Pointer_High_Dim (uint32_t fat_ptr,
   Emit ("  %%t%u = extractvalue " FAT_PTR_TYPE " %%t%u, 1\n", bptr, fat_ptr);
   uint32_t gep = Emit_Temp ();
   Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-     gep, bt, bptr, dim * 2 + 1);
+     gep, LLVM_Rep_To_String (bt), bptr, dim * 2 + 1);
   uint32_t val = Emit_Temp ();
-  Emit ("  %%t%u = load %s, ptr %%t%u\n", val, bt, gep);
+  Emit ("  %%t%u = load %s, ptr %%t%u\n", val, LLVM_Rep_To_String (bt), gep);
   return Val_Rep (val, bt);
 }
 
@@ -18203,7 +18204,7 @@ uint32_t Emit_Alloc_Bounds_MultiDim (uint32_t *bounds_lo, uint32_t *bounds_hi, u
 {
   uint32_t bounds_alloca = Emit_Temp ();
   Emit ("  %%t%u = alloca [%u x %s]  ; bounds for %u dims\n",
-     bounds_alloca, ndims * 2, bt, ndims);
+     bounds_alloca, ndims * 2, LLVM_Rep_To_String (bt), ndims);
   for (uint32_t dim = 0; dim < ndims; dim++) {
     // Callers build bounds at the integer working type; coerce to the bounds
     // block's element type bt (e.g. i32 -> i8 for a small-range index like
@@ -18212,12 +18213,12 @@ uint32_t Emit_Alloc_Bounds_MultiDim (uint32_t *bounds_lo, uint32_t *bounds_hi, u
     uint32_t hi_coerced = Emit_Convert (bounds_hi[dim], Integer_Arith_Rep (), bt).reg;
     uint32_t lo_gep = Emit_Temp ();
     Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-       lo_gep, bt, bounds_alloca, dim * 2);
-    Emit ("  store %s %%t%u, ptr %%t%u\n", bt, lo_coerced, lo_gep);
+       lo_gep, LLVM_Rep_To_String (bt), bounds_alloca, dim * 2);
+    Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (bt), lo_coerced, lo_gep);
     uint32_t hi_gep = Emit_Temp ();
     Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-       hi_gep, bt, bounds_alloca, dim * 2 + 1);
-    Emit ("  store %s %%t%u, ptr %%t%u\n", bt, hi_coerced, hi_gep);
+       hi_gep, LLVM_Rep_To_String (bt), bounds_alloca, dim * 2 + 1);
+    Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (bt), hi_coerced, hi_gep);
   }
   return bounds_alloca;
 }
@@ -18255,11 +18256,11 @@ uint32_t Emit_Alloc_Bounds_Struct (uint32_t low_temp, uint32_t high_temp, LLVM_R
   uint32_t low_gep = Emit_Temp ();
   Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 0, i32 0\n",
      low_gep, bounds_struct, bounds_alloca);
-  Emit ("  store %s %%t%u, ptr %%t%u\n", bt, low_temp, low_gep);
+  Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (bt), low_temp, low_gep);
   uint32_t high_gep = Emit_Temp ();
   Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 0, i32 1\n",
      high_gep, bounds_struct, bounds_alloca);
-  Emit ("  store %s %%t%u, ptr %%t%u\n", bt, high_temp, high_gep);
+  Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (bt), high_temp, high_gep);
   return bounds_alloca;
 }
 LLVM_Value Emit_Fat_Pointer_Dynamic (uint32_t data_ptr,
@@ -18295,11 +18296,11 @@ uint32_t Emit_Heap_Bounds_Struct (uint32_t low_temp, uint32_t high_temp, LLVM_Re
   uint32_t low_gep = Emit_Temp ();
   Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 0, i32 0\n",
      low_gep, bounds_struct, bounds_ptr);
-  Emit ("  store %s %%t%u, ptr %%t%u\n", bt, low_temp, low_gep);
+  Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (bt), low_temp, low_gep);
   uint32_t high_gep = Emit_Temp ();
   Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 0, i32 1\n",
      high_gep, bounds_struct, bounds_ptr);
-  Emit ("  store %s %%t%u, ptr %%t%u\n", bt, high_temp, high_gep);
+  Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (bt), high_temp, high_gep);
   return bounds_ptr;
 }
 
@@ -18325,9 +18326,9 @@ LLVM_Value Emit_Fat_Pointer_Length (uint32_t fat_ptr,
   uint32_t low = Emit_Fat_Pointer_Low (fat_ptr, bt).reg;
   uint32_t high = Emit_Fat_Pointer_High (fat_ptr, bt).reg;
   uint32_t diff = Emit_Temp ();
-  Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", diff, bt, high, low);
+  Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", diff, LLVM_Rep_To_String (bt), high, low);
   uint32_t len = Emit_Temp ();
-  Emit ("  %%t%u = add %s %%t%u, 1\n", len, bt, diff);
+  Emit ("  %%t%u = add %s %%t%u, 1\n", len, LLVM_Rep_To_String (bt), diff);
   return Val_Rep (len, bt);
 }
 
@@ -18339,13 +18340,13 @@ LLVM_Value Emit_Fat_Pointer_Length (uint32_t fat_ptr,
 LLVM_Value Emit_Length_From_Bounds (uint32_t low, uint32_t high, LLVM_Rep bt)
 {
   uint32_t diff = Emit_Temp ();
-  Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", diff, bt, high, low);
+  Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", diff, LLVM_Rep_To_String (bt), high, low);
   uint32_t raw = Emit_Temp ();
-  Emit ("  %%t%u = add %s %%t%u, 1\n", raw, bt, diff);
+  Emit ("  %%t%u = add %s %%t%u, 1\n", raw, LLVM_Rep_To_String (bt), diff);
   uint32_t neg = Emit_Temp ();
-  Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, bt, raw);
+  Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, LLVM_Rep_To_String (bt), raw);
   uint32_t len = Emit_Temp ();
-  Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n", len, neg, bt, bt, raw);
+  Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n", len, neg, LLVM_Rep_To_String (bt), LLVM_Rep_To_String (bt), raw);
   return Val_Rep (len, bt);
 }
 
@@ -18405,7 +18406,7 @@ void Emit_Fat_To_Array_Memcpy (uint32_t fat_val,
   uint32_t byte_len = len;
   if (element_size > 1) {
     byte_len = Emit_Temp ();
-    Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_len, bnd_type, len, element_size);
+    Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_len, LLVM_Rep_To_String (bnd_type), len, element_size);
   }
   uint32_t byte_len_64 = Emit_Extend_To_I64 (byte_len, bnd_type).reg;
   Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %%t%u, i1 false)\n",
@@ -18426,13 +18427,13 @@ void Emit_Fat_To_Array_Memcpy (uint32_t fat_val,
 LLVM_Value Emit_Length_Clamped (uint32_t low, uint32_t high, LLVM_Rep bt)
 {
   uint32_t diff = Emit_Temp ();
-  Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", diff, bt, high, low);
+  Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", diff, LLVM_Rep_To_String (bt), high, low);
   uint32_t unclamped = Emit_Temp ();
-  Emit ("  %%t%u = add %s %%t%u, 1\n", unclamped, bt, diff);
+  Emit ("  %%t%u = add %s %%t%u, 1\n", unclamped, LLVM_Rep_To_String (bt), diff);
   uint32_t is_null = Emit_Temp ();
-  Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u\n", is_null, bt, low, high);
+  Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u\n", is_null, LLVM_Rep_To_String (bt), low, high);
   uint32_t len = Emit_Temp ();
-  Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n", len, is_null, bt, bt, unclamped);
+  Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n", len, is_null, LLVM_Rep_To_String (bt), LLVM_Rep_To_String (bt), unclamped);
   return Val_Rep (len, bt);
 }
 
@@ -18757,10 +18758,10 @@ LLVM_I1 Emit_Fat_Pointer_Compare (uint32_t left_fat, uint32_t right_fat, LLVM_Re
 LLVM_Value Emit_Min_Value (uint32_t left, uint32_t right, LLVM_Rep rep) {
   LLVM_Rep ty = rep;
   uint32_t cmp = Emit_Temp ();
-  Emit ("  %%t%u = icmp slt %s %%t%u, %%t%u\n", cmp, ty, left, right);
+  Emit ("  %%t%u = icmp slt %s %%t%u, %%t%u\n", cmp, LLVM_Rep_To_String (ty), left, right);
   uint32_t result = Emit_Temp ();
   Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u\n",
-     result, cmp, ty, left, ty, right);
+     result, cmp, LLVM_Rep_To_String (ty), left, LLVM_Rep_To_String (ty), right);
   return Val_Rep (result, rep);
 }
 
@@ -18893,7 +18894,7 @@ uint32_t Emit_Array_Lex_Compare (uint32_t left_ptr, uint32_t right_ptr, uint32_t
 
   // byte_size = min_len * elem_size
   uint32_t byte_size_nat = Emit_Temp ();
-  Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_size_nat, bt, min_len, elem_size);
+  Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_size_nat, LLVM_Rep_To_String (bt), min_len, elem_size);
   uint32_t byte_size = Emit_Extend_To_I64 (byte_size_nat, bt).reg;
 
   // prefix_cmp = memcmp (left_data, right_data, byte_size)
@@ -18903,9 +18904,9 @@ uint32_t Emit_Array_Lex_Compare (uint32_t left_ptr, uint32_t right_ptr, uint32_t
 
   // If prefix differs, return prefix_cmp; otherwise return len_diff
   uint32_t len_diff = Emit_Temp ();
-  Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", len_diff, bt, left_len, right_len);
+  Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", len_diff, LLVM_Rep_To_String (bt), left_len, right_len);
   uint32_t len_diff32 = Emit_Temp ();
-  Emit ("  %%t%u = trunc %s %%t%u to i32\n", len_diff32, bt, len_diff);
+  Emit ("  %%t%u = trunc %s %%t%u to i32\n", len_diff32, LLVM_Rep_To_String (bt), len_diff);
   uint32_t prefix_zero = Emit_Temp ();
   Emit ("  %%t%u = icmp eq " C_INT_TYPE " %%t%u, 0\n", prefix_zero, prefix_cmp);
   uint32_t result = Emit_Temp ();
@@ -18982,12 +18983,12 @@ void Emit_Fat_Pointer_Extractvalue_Named (const char *src_name, const char *data
   // GEP + load low bound in native bt
   Emit ("  %%%s_gep = getelementptr %s, ptr %%%s_bptr, i32 0, i32 0\n",
      low_name, bounds_struct, src_name);
-  Emit ("  %%%s = load %s, ptr %%%s_gep\n", low_name, bt, low_name);
+  Emit ("  %%%s = load %s, ptr %%%s_gep\n", low_name, LLVM_Rep_To_String (bt), low_name);
 
   // GEP + load high bound in native bt
   Emit ("  %%%s_gep = getelementptr %s, ptr %%%s_bptr, i32 0, i32 1\n",
      high_name, bounds_struct, src_name);
-  Emit ("  %%%s = load %s, ptr %%%s_gep\n", high_name, bt, high_name);
+  Emit ("  %%%s = load %s, ptr %%%s_gep\n", high_name, LLVM_Rep_To_String (bt), high_name);
 }
 
 // Emit a named-SSA widen from bound type to INTEGER width for intrinsic/RTS use.                  
@@ -19005,9 +19006,9 @@ void Emit_Widen_Named_For_Intrinsic (const char *src_name, const char *dst_name,
 
   // Already at INTEGER width - emit a trivial add-0 to create the alias
   if (LLVM_Rep_Equal (bt, iat)) {
-    Emit ("  %%%s = add %s %%%s, 0\n", dst_name, iat_s, src_name);
+    Emit ("  %%%s = add %s %%%s, 0\n", dst_name, LLVM_Rep_To_String (iat_s), src_name);
   } else {
-    Emit ("  %%%s = sext %s %%%s to %s\n", dst_name, bt_s, src_name, iat_s);
+    Emit ("  %%%s = sext %s %%%s to %s\n", dst_name, LLVM_Rep_To_String (bt_s), src_name, LLVM_Rep_To_String (iat_s));
   }
 }
 
@@ -19023,9 +19024,9 @@ void Emit_Narrow_Named_From_Intrinsic (const char *src_name, const char *dst_nam
   LLVM_Rep bt_s = bt;
   LLVM_Rep iat_s = iat;
   if (LLVM_Rep_Equal (bt, iat)) {
-    Emit ("  %%%s = add %s %%%s, 0\n", dst_name, iat_s, src_name);
+    Emit ("  %%%s = add %s %%%s, 0\n", dst_name, LLVM_Rep_To_String (iat_s), src_name);
   } else {
-    Emit ("  %%%s = trunc %s %%%s to %s\n", dst_name, iat_s, src_name, bt_s);
+    Emit ("  %%%s = trunc %s %%%s to %s\n", dst_name, LLVM_Rep_To_String (iat_s), src_name, LLVM_Rep_To_String (bt_s));
   }
 }
 
@@ -19277,14 +19278,14 @@ uint32_t Generate_Lvalue (Syntax_Node *node) {
               lo_d = Emit_Convert (lo_d, dyn_lv_bt, idx_lv_iat).reg;
               uint32_t adj = Emit_Temp ();
               Emit ("  %%t%u = sub %s %%t%u, %%t%u  ; lv dim %u dyn low adj\n",
-                 adj, idx_lv_iat_s, dim_idx, lo_d, d);
+                 adj, LLVM_Rep_To_String (idx_lv_iat_s), dim_idx, lo_d, d);
               dim_idx = adj;
             } else {
               int128_t lo_d = Type_Bound_Value (prefix_type->array.indices[d].low_bound);
               if (lo_d != 0) {
                 uint32_t adj = Emit_Temp ();
                 Emit ("  %%t%u = sub %s %%t%u, %s  ; lv dim %u low adj\n",
-                   adj, idx_lv_iat_s, dim_idx, I128_Decimal (lo_d), d);
+                   adj, LLVM_Rep_To_String (idx_lv_iat_s), dim_idx, I128_Decimal (lo_d), d);
                 dim_idx = adj;
               }
             }
@@ -19300,14 +19301,14 @@ uint32_t Generate_Lvalue (Syntax_Node *node) {
                 } else {
                   uint32_t product = Emit_Temp ();
                   Emit ("  %%t%u = mul %s %%t%u, %%t%u\n",
-                     product, idx_lv_iat_s, stride_val, len_d2);
+                     product, LLVM_Rep_To_String (idx_lv_iat_s), stride_val, len_d2);
                   stride_val = product;
                 }
               }
               if (stride_val != 0) {
                 uint32_t scaled = Emit_Temp ();
                 Emit ("  %%t%u = mul %s %%t%u, %%t%u  ; lv dim %u dyn stride\n",
-                   scaled, idx_lv_iat_s, dim_idx, stride_val, d);
+                   scaled, LLVM_Rep_To_String (idx_lv_iat_s), dim_idx, stride_val, d);
                 dim_idx = scaled;
               }
             } else {
@@ -19321,7 +19322,7 @@ uint32_t Generate_Lvalue (Syntax_Node *node) {
               if (stride > 1) {
                 uint32_t scaled = Emit_Temp ();
                 Emit ("  %%t%u = mul %s %%t%u, %u  ; lv dim %u stride\n",
-                   scaled, idx_lv_iat_s, dim_idx, stride, d);
+                   scaled, LLVM_Rep_To_String (idx_lv_iat_s), dim_idx, stride, d);
                 dim_idx = scaled;
               }
             }
@@ -19330,7 +19331,7 @@ uint32_t Generate_Lvalue (Syntax_Node *node) {
             } else {
               uint32_t sum = Emit_Temp ();
               Emit ("  %%t%u = add %s %%t%u, %%t%u\n",
-                 sum, idx_lv_iat_s, flat_idx, dim_idx);
+                 sum, LLVM_Rep_To_String (idx_lv_iat_s), flat_idx, dim_idx);
               flat_idx = sum;
             }
           }
@@ -19351,23 +19352,23 @@ uint32_t Generate_Lvalue (Syntax_Node *node) {
             int128_t hi = Type_Bound_Value (prefix_type->array.indices[0].high_bound);
             if (lo != hi or lo != 0) {
               uint32_t lo_t = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %s  ; lv low bound\n", lo_t, idx_lv_iat_s, I128_Decimal (lo));
+              Emit ("  %%t%u = add %s 0, %s  ; lv low bound\n", lo_t, LLVM_Rep_To_String (idx_lv_iat_s), I128_Decimal (lo));
               uint32_t hi_t = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %s  ; lv high bound\n", hi_t, idx_lv_iat_s, I128_Decimal (hi));
+              Emit ("  %%t%u = add %s 0, %s  ; lv high bound\n", hi_t, LLVM_Rep_To_String (idx_lv_iat_s), I128_Decimal (hi));
               idx = Emit_Index_Check (Val_Rep (idx, idx_lv_iat), Val_Rep (lo_t, idx_lv_iat), Val_Rep (hi_t, idx_lv_iat), idx_lv_iat, prefix_type);
             }
           }
           if (has_dynamic_low) {
             uint32_t dynamic_low_conv = Emit_Convert (dynamic_low, dyn_lv_bt, idx_lv_iat).reg;
             uint32_t adj = Emit_Temp ();
-            Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", adj, idx_lv_iat_s, idx, dynamic_low_conv);
+            Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", adj, LLVM_Rep_To_String (idx_lv_iat_s), idx, dynamic_low_conv);
             idx = adj;
           } else {
             int128_t low_bound = Array_Low_Bound (prefix_type);
             if (low_bound != 0) {
               uint32_t adj = Emit_Temp ();
               Emit ("  %%t%u = sub %s %%t%u, %s\n",
-                 adj, idx_lv_iat_s, idx, I128_Decimal (low_bound));
+                 adj, LLVM_Rep_To_String (idx_lv_iat_s), idx, I128_Decimal (low_bound));
               idx = adj;
             }
           }
@@ -19389,9 +19390,9 @@ uint32_t Generate_Lvalue (Syntax_Node *node) {
           uint64_t bytes = (uint64_t)elem_type_info->size;
           uint32_t offset = Emit_Temp ();
           Emit ("  %%t%u = mul %s %%t%u, %llu\n",
-             offset, idx_lv_iat_s, flat_idx, (unsigned long long)bytes);
+             offset, LLVM_Rep_To_String (idx_lv_iat_s), flat_idx, (unsigned long long)bytes);
           Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u  ; composite elem lvalue\n",
-             ptr, base, idx_lv_iat_s, offset);
+             ptr, base, LLVM_Rep_To_String (idx_lv_iat_s), offset);
         } else {
           LLVM_Rep elem_rep = Type_To_Rep (elem_type_info);
           Emit ("  %%t%u = getelementptr %s, ptr %%t%u, %s %%t%u  ; elem lvalue\n",
@@ -19416,7 +19417,7 @@ LLVM_Value Generate_Bound_Value (Type_Bound bound, LLVM_Rep target_rep) {
 
   if (bound.kind == BOUND_INTEGER) {
     Emit ("  %%t%u = add %s 0, %s  ; bound (integer)\n",
-       result, bound_s, I128_Decimal (bound.int_value));
+       result, LLVM_Rep_To_String (bound_s), I128_Decimal (bound.int_value));
     return Val_Rep (result, bound_rep);
   }
 
@@ -19424,7 +19425,7 @@ LLVM_Value Generate_Bound_Value (Type_Bound bound, LLVM_Rep target_rep) {
   // literal, matching the fptosi source type.
   if (bound.kind == BOUND_FLOAT) {
     Emit ("  %%t%u = fptosi double %e to %s  ; bound (float)\n",
-       result, bound.float_value, bound_s);
+       result, bound.float_value, LLVM_Rep_To_String (bound_s));
     return Val_Rep (result, bound_rep);
   }
 
@@ -19432,7 +19433,7 @@ LLVM_Value Generate_Bound_Value (Type_Bound bound, LLVM_Rep target_rep) {
     double val = Eval_Const_Numeric (bound.expr);
     if (val == val) {
       Emit ("  %%t%u = add %s 0, %lld  ; bound (const expr)\n",
-         result, bound_s, (long long)val);
+         result, LLVM_Rep_To_String (bound_s), (long long)val);
       return Val_Rep (result, bound_rep);
     }
 
@@ -19442,7 +19443,7 @@ LLVM_Value Generate_Bound_Value (Type_Bound bound, LLVM_Rep target_rep) {
       expr_result = Emit_Convert (expr_result, expr_rep, bound_rep).reg;
     return Val_Rep (expr_result, bound_rep);
   }
-  Emit ("  %%t%u = add %s 0, 0  ; bound (unknown)\n", result, bound_s);
+  Emit ("  %%t%u = add %s 0, 0  ; bound (unknown)\n", result, LLVM_Rep_To_String (bound_s));
   return Val_Rep (result, bound_rep);
 }
 LLVM_Value Generate_Integer_Literal (Syntax_Node *node) {
@@ -19771,6 +19772,7 @@ LLVM_Value Generate_Identifier (Syntax_Node *node) {
         { LLVM_Rep efty = Type_To_Rep (actual->type);
         Emit ("  %%t%u = add %s 0, %lld  ; enum literal as function\n",
            t, LLVM_Rep_To_String (efty), (long long)pos);
+        return Val_Rep (t, efty);
         }
 
       // Generate actual function call.
@@ -19818,7 +19820,10 @@ LLVM_Value Generate_Identifier (Syntax_Node *node) {
           Emit ("()\n");
         }
 
-        // No widening - return value stays at native type width.
+        // Return the rep actually emitted (the callee's return type), not
+        // node->type — a shadowed name (e.g. a user function named INTEGER)
+        // can leave node->type pointing at an unrelated predefined type.
+        return Val_Rep (t, ret_rep);
 
       } else {
         Emit ("  %%t%u = add %s 0, 0  ; unhandled function symbol\n", t, LLVM_Rep_To_String (Integer_Arith_Rep ()));
@@ -20239,15 +20244,15 @@ uint32_t Generate_Composite_Address (Syntax_Node *node) {
         LLVM_Rep slice_idx_t = Integer_Arith_Rep ();
         if (low != 0) {
           adj = Emit_Temp ();
-          Emit ("  %%t%u = sub %s %%t%u, %s\n", adj, slice_idx_t, slice_low, I128_Decimal (low));
+          Emit ("  %%t%u = sub %s %%t%u, %s\n", adj, LLVM_Rep_To_String (slice_idx_t), slice_low, I128_Decimal (low));
         }
         uint32_t byte_off = adj;
         if (elem_size != 1) {
           byte_off = Emit_Temp ();
-          Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_off, slice_idx_t, adj, elem_size);
+          Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_off, LLVM_Rep_To_String (slice_idx_t), adj, elem_size);
         }
         uint32_t addr = Emit_Temp ();
-        Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n", addr, base, slice_idx_t, byte_off);
+        Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n", addr, base, LLVM_Rep_To_String (slice_idx_t), byte_off);
         return addr;
       }
       uint32_t base;
@@ -20281,10 +20286,10 @@ uint32_t Generate_Composite_Address (Syntax_Node *node) {
       if (elem_size == 1) {
         byte_off = adj_idx;
       } else {
-        Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_off, comp_idx_t, adj_idx, elem_size);
+        Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_off, LLVM_Rep_To_String (comp_idx_t), adj_idx, elem_size);
       }
       uint32_t addr = Emit_Temp ();
-      Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n", addr, base, comp_idx_t, byte_off);
+      Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n", addr, base, LLVM_Rep_To_String (comp_idx_t), byte_off);
       return addr;
     }
 
@@ -20299,9 +20304,9 @@ uint32_t Generate_Composite_Address (Syntax_Node *node) {
       uint32_t low_conv = Emit_Convert (low, str_bt, str_idx_t).reg;
       uint32_t idx = Generate_Expression (node->apply.arguments.items[0]).reg;
       uint32_t adj_idx = Emit_Temp ();
-      Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", adj_idx, str_idx_t, idx, low_conv);
+      Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", adj_idx, LLVM_Rep_To_String (str_idx_t), idx, low_conv);
       uint32_t addr = Emit_Temp ();
-      Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n", addr, data, str_idx_t, adj_idx);
+      Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n", addr, data, LLVM_Rep_To_String (str_idx_t), adj_idx);
       return addr;
     }
   }
@@ -20967,7 +20972,7 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
 
     // Total length
     uint32_t total_len = Emit_Temp ();
-    Emit ("  %%t%u = add %s %%t%u, %%t%u\n", total_len, cat_bt, left_len1, right_len1);
+    Emit ("  %%t%u = add %s %%t%u, %%t%u\n", total_len, LLVM_Rep_To_String (cat_bt), left_len1, right_len1);
 
     // Check result length against index SUBTYPE bounds (RM 4.5.3(7)).                             
     // The check is against the index subtype (e.g., POSITIVE for STRING),                          
@@ -21043,10 +21048,10 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
         idx_first = idx_ty->low_bound.int_value;
     }
     uint32_t res_lo = Emit_Temp ();
-    Emit ("  %%t%u = add %s 0, %s\n", res_lo, cat_bt, I128_Decimal (idx_first));
+    Emit ("  %%t%u = add %s 0, %s\n", res_lo, LLVM_Rep_To_String (cat_bt), I128_Decimal (idx_first));
     uint32_t res_hi = Emit_Temp ();
     Emit ("  %%t%u = add %s %%t%u, %s  ; first + total_len - 1\n",
-       res_hi, cat_bt, total_len, I128_Decimal (idx_first - 1));
+       res_hi, LLVM_Rep_To_String (cat_bt), total_len, I128_Decimal (idx_first - 1));
 
     // Return fat pointer to result
     return Emit_Fat_Pointer_Dynamic (result_data, res_lo, res_hi, cat_bt);
@@ -21155,15 +21160,15 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
     // Fixed * Fixed: result = (a * b) >> abs(scale)
     if (node->binary.op == TK_STAR) {
       uint32_t mul = Emit_Temp ();
-      Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", mul, fix_type, left, right);
+      Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", mul, LLVM_Rep_To_String (fix_type), left, right);
 
       // Negative scale = right shift by |scale|
       if (scale < 0) {
-        Emit ("  %%t%u = ashr %s %%t%u, %d\n", t, fix_type, mul, -scale);
+        Emit ("  %%t%u = ashr %s %%t%u, %d\n", t, LLVM_Rep_To_String (fix_type), mul, -scale);
 
       // Positive scale = left shift (uncommon)
       } else if (scale > 0) {
-        Emit ("  %%t%u = shl %s %%t%u, %d\n", t, fix_type, mul, scale);
+        Emit ("  %%t%u = shl %s %%t%u, %d\n", t, LLVM_Rep_To_String (fix_type), mul, scale);
       } else {
         t = mul;
       }
@@ -21173,13 +21178,13 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
     } else {
       uint32_t shifted = Emit_Temp ();
       if (scale < 0) {
-        Emit ("  %%t%u = shl %s %%t%u, %d\n", shifted, fix_type, left, -scale);
+        Emit ("  %%t%u = shl %s %%t%u, %d\n", shifted, LLVM_Rep_To_String (fix_type), left, -scale);
       } else if (scale > 0) {
-        Emit ("  %%t%u = ashr %s %%t%u, %d\n", shifted, fix_type, left, scale);
+        Emit ("  %%t%u = ashr %s %%t%u, %d\n", shifted, LLVM_Rep_To_String (fix_type), left, scale);
       } else {
         shifted = left;
       }
-      Emit ("  %%t%u = sdiv %s %%t%u, %%t%u\n", t, fix_type, shifted, right);
+      Emit ("  %%t%u = sdiv %s %%t%u, %%t%u\n", t, LLVM_Rep_To_String (fix_type), shifted, right);
       return Val_Rep (t, fix_type);
     }
   }
@@ -21252,7 +21257,7 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
           const char *pow_fn = (pow_unsigned or pow_suppressed)
             ? "__ada_modular_pow" : "__ada_integer_pow";
           Emit ("  %%t%u = call %s @%s(%s %%t%u, %s %%t%u)\n",
-             t, iat, pow_fn, iat, left, iat, right);
+             t, LLVM_Rep_To_String (iat), pow_fn, LLVM_Rep_To_String (iat), left, LLVM_Rep_To_String (iat), right);
         }
         return Val_Rep (t, Integer_Arith_Rep ());
       }
@@ -21382,7 +21387,7 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
         if (left_is_float and not right_is_float) {
           uint32_t conv = Emit_Temp ();
           const char *itof_cmp = Type_Is_Unsigned (right_type) ? "uitofp" : "sitofp";
-          Emit ("  %%t%u = %s %s %%t%u to %s\n", conv, itof_cmp, right_llvm_type, right, LLVM_Rep_To_String (float_type));
+          Emit ("  %%t%u = %s %s %%t%u to %s\n", conv, itof_cmp, LLVM_Rep_To_String (right_llvm_type), right, LLVM_Rep_To_String (float_type));
           right = conv;
 
           // Fixed-point: scale by SMALL to get actual value.
@@ -21394,9 +21399,9 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
             if (small <= 0) small = resolved_right->fixed.delta > 0 ? resolved_right->fixed.delta : 1.0;
             uint64_t bits; memcpy (&bits, &small, sizeof (bits));
             uint32_t small_t = Emit_Temp ();
-            Emit ("  %%t%u = fadd %s 0.0, 0x%016llX\n", small_t, float_type, (unsigned long long)bits);
+            Emit ("  %%t%u = fadd %s 0.0, 0x%016llX\n", small_t, LLVM_Rep_To_String (float_type), (unsigned long long)bits);
             uint32_t scaled = Emit_Temp ();
-            Emit ("  %%t%u = fmul %s %%t%u, %%t%u\n", scaled, float_type, right, small_t);
+            Emit ("  %%t%u = fmul %s %%t%u, %%t%u\n", scaled, LLVM_Rep_To_String (float_type), right, small_t);
             right = scaled;
           }
           right_is_float = true;
@@ -21413,9 +21418,9 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
             if (small <= 0) small = resolved_left->fixed.delta > 0 ? resolved_left->fixed.delta : 1.0;
             uint64_t bits; memcpy (&bits, &small, sizeof (bits));
             uint32_t small_t = Emit_Temp ();
-            Emit ("  %%t%u = fadd %s 0.0, 0x%016llX\n", small_t, right_float_type, (unsigned long long)bits);
+            Emit ("  %%t%u = fadd %s 0.0, 0x%016llX\n", small_t, LLVM_Rep_To_String (right_float_type), (unsigned long long)bits);
             uint32_t div_t = Emit_Temp ();
-            Emit ("  %%t%u = fdiv %s %%t%u, %%t%u\n", div_t, right_float_type, right, small_t);
+            Emit ("  %%t%u = fdiv %s %%t%u, %%t%u\n", div_t, LLVM_Rep_To_String (right_float_type), right, small_t);
             right = div_t;
           }
           uint32_t conv = Emit_Temp ();
@@ -21598,10 +21603,10 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
                    st, (unsigned long long)sb);
                 uint32_t dv = Emit_Temp ();
                 Emit ("  %%t%u = fdiv %s %%t%u, %%t%u  ; bound/small\n",
-                   dv, lo_type, lo, st);
-                Emit ("  %%t%u = fptosi %s %%t%u to %s\n", cv, lo_type, dv, iat2);
+                   dv, LLVM_Rep_To_String (lo_type), lo, st);
+                Emit ("  %%t%u = fptosi %s %%t%u to %s\n", cv, LLVM_Rep_To_String (lo_type), dv, LLVM_Rep_To_String (iat2));
               } else {
-                Emit ("  %%t%u = fptosi %s %%t%u to %s\n", cv, lo_type, lo, iat2);
+                Emit ("  %%t%u = fptosi %s %%t%u to %s\n", cv, LLVM_Rep_To_String (lo_type), lo, LLVM_Rep_To_String (iat2));
               }
               lo = cv; lo_type = iat2;
             }
@@ -21614,16 +21619,16 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
                    st, (unsigned long long)sb);
                 uint32_t dv = Emit_Temp ();
                 Emit ("  %%t%u = fdiv %s %%t%u, %%t%u  ; bound/small\n",
-                   dv, hi_type, hi, st);
-                Emit ("  %%t%u = fptosi %s %%t%u to %s\n", cv, hi_type, dv, iat2);
+                   dv, LLVM_Rep_To_String (hi_type), hi, st);
+                Emit ("  %%t%u = fptosi %s %%t%u to %s\n", cv, LLVM_Rep_To_String (hi_type), dv, LLVM_Rep_To_String (iat2));
               } else {
-                Emit ("  %%t%u = fptosi %s %%t%u to %s\n", cv, hi_type, hi, iat2);
+                Emit ("  %%t%u = fptosi %s %%t%u to %s\n", cv, LLVM_Rep_To_String (hi_type), hi, LLVM_Rep_To_String (iat2));
               }
               hi = cv; hi_type = iat2;
             }
             if (LLVM_Rep_Is_Float (left_int_type)) {
               uint32_t cv = Emit_Temp (); LLVM_Rep iat2 = Integer_Arith_Rep ();
-              Emit ("  %%t%u = fptosi %s %%t%u to %s\n", cv, left_int_type, left, iat2);
+              Emit ("  %%t%u = fptosi %s %%t%u to %s\n", cv, LLVM_Rep_To_String (left_int_type), left, LLVM_Rep_To_String (iat2));
               left = cv; left_int_type = iat2;
             }
             LLVM_Rep mem_ct = LLVM_Rep_Wider_Int (left_int_type, LLVM_Rep_Wider_Int (lo_type, hi_type));
@@ -21771,7 +21776,7 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
           // Fallback: equality with right operand value
           } else {
             if (left_is_flt) {
-              Emit ("  %%t%u = fcmp oeq %s %%t%u, %%t%u\n", t, mem_float_type, left, right);
+              Emit ("  %%t%u = fcmp oeq %s %%t%u, %%t%u\n", t, LLVM_Rep_To_String (mem_float_type), left, right);
 
             // use common native type for equality.
             } else {
@@ -21853,7 +21858,7 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
     // Add/sub/mul: use overflow-checked intrinsics for signed types (RM 4.5).
     // Modular types wrap naturally; Emit_Overflow_Checked_Op handles this.
     else if (binop == TK_PLUS or binop == TK_MINUS or binop == TK_STAR) {
-      t = Emit_Overflow_Checked_Op (left, right, op, result_type).reg;
+      t = Emit_Overflow_Checked_Op (left, right, op, common_rep, result_type).reg;
     } else {
       Emit ("  %%t%u = %s %s %%t%u, %%t%u\n", t, op, LLVM_Rep_To_String (common_rep), left, right);
     }
@@ -21968,7 +21973,7 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
         Type_Info *res_type = node->type ? node->type : op_type_info;
         uint32_t zero = Emit_Temp ();
         Emit ("  %%t%u = add %s 0, 0\n", zero, LLVM_Rep_To_String (unary_int_type));
-        t = Emit_Overflow_Checked_Op (zero, operand, "sub", res_type).reg;
+        t = Emit_Overflow_Checked_Op (zero, operand, "sub", unary_int_type, res_type).reg;
 
         // Modular wrapping for unary minus (RM 4.5.3): -x = modulus - x.                          
         // For power-of-2 moduli, the sub already wraps correctly.                                 
@@ -22044,8 +22049,8 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
         } else {
           Type_Info *res_type = node->type ? node->type : op_type_info;
           uint32_t zero = Emit_Temp ();
-          Emit ("  %%t%u = add %s 0, 0\n", zero, unary_int_type);
-          uint32_t neg = Emit_Overflow_Checked_Op (zero, operand, "sub", res_type).reg;
+          Emit ("  %%t%u = add %s 0, 0\n", zero, LLVM_Rep_To_String (unary_int_type));
+          uint32_t neg = Emit_Overflow_Checked_Op (zero, operand, "sub", unary_int_type, res_type).reg;
           uint32_t cmp = Emit_Temp ();
           Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", cmp, LLVM_Rep_To_String (unary_int_type), operand);
           Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u\n",
@@ -22196,13 +22201,13 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
       // ABS with overflow check: ABS (MIN_INT) overflows
       if (Slice_Equal_Ignore_Case (op_name, S("abs"))) {
         uint32_t zero = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, 0\n", zero, t0);
-        uint32_t neg = Emit_Overflow_Checked_Op (zero, v0, "sub", ty0).reg;
+        Emit ("  %%t%u = add %s 0, 0\n", zero, LLVM_Rep_To_String (t0));
+        uint32_t neg = Emit_Overflow_Checked_Op (zero, v0, "sub", t0, ty0).reg;
         uint32_t cmp = Emit_Temp ();
-        Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", cmp, t0, v0);
+        Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", cmp, LLVM_Rep_To_String (t0), v0);
         uint32_t result = Emit_Temp ();
         Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u\n",
-           result, cmp, t0, neg, t0, v0);
+           result, cmp, LLVM_Rep_To_String (t0), neg, LLVM_Rep_To_String (t0), v0);
         return Val_Rep (result, t0);
       }
       if (Slice_Equal_Ignore_Case (op_name, S("not"))) {
@@ -22215,7 +22220,7 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
       }
       if (Slice_Equal_Ignore_Case (op_name, S("-"))) {
         uint32_t result = Emit_Temp ();
-        Emit ("  %%t%u = sub %s 0, %%t%u\n", result, t0, v0);
+        Emit ("  %%t%u = sub %s 0, %%t%u\n", result, LLVM_Rep_To_String (t0), v0);
         return Val_Rep (result, t0);
       }
     }
@@ -22296,7 +22301,7 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
               uint32_t char_trunc = Emit_Convert (left_val, char_src_type, LLVM_Rep_Int (8, false)).reg;
               Emit ("  store i8 %%t%u, ptr %%t%u\n", char_trunc, char_alloc);
               uint32_t one = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, 1\n", one, concat_bt);
+              Emit ("  %%t%u = add %s 0, 1\n", one, LLVM_Rep_To_String (concat_bt));
 
               // Extract right string bounds and data
               uint32_t right_data = Emit_Fat_Pointer_Data (right_val, concat_bt).reg;
@@ -22306,7 +22311,7 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
 
               // Total length = 1 + right_len
               uint32_t total_len = Emit_Temp ();
-              Emit ("  %%t%u = add %s 1, %%t%u\n", total_len, concat_bt, right_len1);
+              Emit ("  %%t%u = add %s 1, %%t%u\n", total_len, LLVM_Rep_To_String (concat_bt), right_len1);
 
               // Extend to i64 for C-level calls
               uint32_t total_len_64 = Emit_Extend_To_I64 (total_len, concat_bt).reg;
@@ -22342,7 +22347,7 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
               uint32_t left_len1 = Emit_Length_From_Bounds (left_low, left_high, concat_bt).reg;
               uint32_t right_len1 = Emit_Length_From_Bounds (right_low, right_high, concat_bt).reg;
               uint32_t total_len = Emit_Temp ();
-              Emit ("  %%t%u = add %s %%t%u, %%t%u\n", total_len, concat_bt, left_len1, right_len1);
+              Emit ("  %%t%u = add %s %%t%u, %%t%u\n", total_len, LLVM_Rep_To_String (concat_bt), left_len1, right_len1);
 
               // Extend to i64 for C-level calls
               uint32_t total_len_64 = Emit_Extend_To_I64 (total_len, concat_bt).reg;
@@ -22359,7 +22364,7 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
               Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %%t%u, i1 false)\n",
                  right_dest, right_data, right_len1_64);
               uint32_t one = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, 1\n", one, concat_bt);
+              Emit ("  %%t%u = add %s 0, 1\n", one, LLVM_Rep_To_String (concat_bt));
               return Emit_Fat_Pointer_Dynamic (result_data, one, total_len, concat_bt);
             }
           }
@@ -22510,22 +22515,22 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
       if (dyn_low) {
         uint32_t low_bound_conv = Emit_Convert (low_bound_val, dyn_low_bt, slice_iat).reg;
         off = Emit_Temp ();
-        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", off, slice_iat, slo, low_bound_conv);
+        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", off, LLVM_Rep_To_String (slice_iat), slo, low_bound_conv);
       } else {
         int128_t al = Array_Low_Bound (at);
         if (al != 0) {
           off = Emit_Temp ();
-          Emit ("  %%t%u = sub %s %%t%u, %s\n", off, slice_iat, slo, I128_Decimal (al));
+          Emit ("  %%t%u = sub %s %%t%u, %s\n", off, LLVM_Rep_To_String (slice_iat), slo, I128_Decimal (al));
         } else off = slo;
       }
       uint32_t dp = Emit_Temp ();
       if (esz == 1) {
-        Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n", dp, base, slice_iat, off);
+        Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n", dp, base, LLVM_Rep_To_String (slice_iat), off);
       } else {
         uint32_t bo = Emit_Temp ();
         LLVM_Rep iat_gep = Integer_Arith_Rep ();
-        Emit ("  %%t%u = mul %s %%t%u, %u\n", bo, iat_gep, off, esz);
-        Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n", dp, base, iat_gep, bo);
+        Emit ("  %%t%u = mul %s %%t%u, %u\n", bo, LLVM_Rep_To_String (iat_gep), off, esz);
+        Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n", dp, base, LLVM_Rep_To_String (iat_gep), bo);
       }
       {
         LLVM_Rep slice_bt = Array_Bound_LLVM_Rep (at);
@@ -22690,7 +22695,7 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
               } else {
                 expected = Emit_Temp ();
                 Emit ("  %%t%u = add %s 0, %lld  ; expected disc\n",
-                   expected, iat,
+                   expected, LLVM_Rep_To_String (iat),
                    (long long)formal_type->record.disc_constraint_values[di]);
               }
               Emit_Discriminant_Check (disc_val, expected, iat, formal_type);
@@ -22757,7 +22762,7 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
                 expected = Emit_Temp ();
                 Emit ("  %%t%u = add %s 0, %lld"
                      "  ; expected disc value\n",
-                   expected, iat,
+                   expected, LLVM_Rep_To_String (iat),
                    (long long)formal_type->record.disc_constraint_values[di]);
               }
               Emit_Discriminant_Check (disc_val, expected,
@@ -22804,9 +22809,9 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
                   int128_t lo_d = Type_Bound_Value (actual_type->array.indices[d].low_bound);
                   int128_t hi_d = Type_Bound_Value (actual_type->array.indices[d].high_bound);
                   mlo[d] = Emit_Temp ();
-                  Emit ("  %%t%u = add %s 0, %s  ; dim%u lo\n", mlo[d], abt, I128_Decimal (lo_d), d);
+                  Emit ("  %%t%u = add %s 0, %s  ; dim%u lo\n", mlo[d], LLVM_Rep_To_String (abt), I128_Decimal (lo_d), d);
                   mhi[d] = Emit_Temp ();
-                  Emit ("  %%t%u = add %s 0, %s  ; dim%u hi\n", mhi[d], abt, I128_Decimal (hi_d), d);
+                  Emit ("  %%t%u = add %s 0, %s  ; dim%u hi\n", mhi[d], LLVM_Rep_To_String (abt), I128_Decimal (hi_d), d);
                 }
                 args[i] = Emit_Fat_Pointer_MultiDim (args[i], mlo, mhi, ndims_a, abt).reg;
               } else {
@@ -22933,23 +22938,23 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
               dst_ti->array.indices[0].low_bound.expr) {
             uint32_t lo_v = Generate_Expression (
               dst_ti->array.indices[0].low_bound.expr).reg;
-            Emit ("  %%t%u = add %s 0, %%t%u  ; UC dst lo\n", lo_t, bt, lo_v);
+            Emit ("  %%t%u = add %s 0, %%t%u  ; UC dst lo\n", lo_t, LLVM_Rep_To_String (bt), lo_v);
           } else {
             int128_t lo = Array_Low_Bound (dst_ti);
             Emit ("  %%t%u = add %s 0, %s  ; UC dst lo\n",
-               lo_t, bt, I128_Decimal (lo));
+               lo_t, LLVM_Rep_To_String (bt), I128_Decimal (lo));
           }
           if (dst_ti->array.index_count > 0 and
               dst_ti->array.indices[0].high_bound.kind == BOUND_EXPR and
               dst_ti->array.indices[0].high_bound.expr) {
             uint32_t hi_v = Generate_Expression (
               dst_ti->array.indices[0].high_bound.expr).reg;
-            Emit ("  %%t%u = add %s 0, %%t%u  ; UC dst hi\n", hi_t, bt, hi_v);
+            Emit ("  %%t%u = add %s 0, %%t%u  ; UC dst hi\n", hi_t, LLVM_Rep_To_String (bt), hi_v);
           } else {
             int128_t hi = (dst_ti->array.index_count > 0)
               ? Type_Bound_Value (dst_ti->array.indices[0].high_bound) : 0;
             Emit ("  %%t%u = add %s 0, %s  ; UC dst hi\n",
-               hi_t, bt, I128_Decimal (hi));
+               hi_t, LLVM_Rep_To_String (bt), I128_Decimal (hi));
           }
           return Emit_Fat_Pointer_Dynamic (buf, lo_t, hi_t, bt);
         }
@@ -22980,6 +22985,56 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
       bip_dest = Emit_Temp ();
       Emit ("  %%t%u = alloca [%u x i8]  ; BIP result space\n",
          bip_dest, type_size);
+    }
+
+    // Trailing IN-mode default arguments (RM 6.4.2): when the call omits
+    // actuals for formals that have a default expression, evaluate the
+    // defaults here, at the call site, in formal order. Pre-compute before
+    // the call instruction text so the default expressions' IR does not
+    // interleave with the call's argument list.
+    uint32_t  provided_count = node->apply.arguments.count;
+    uint32_t  n_default_args = 0;
+    uint32_t *default_arg_vals = NULL;
+    LLVM_Rep *default_arg_types = NULL;
+    if (sym->parameters and provided_count < sym->parameter_count) {
+      uint32_t missing = sym->parameter_count - provided_count;
+      default_arg_vals  = Arena_Allocate (missing * sizeof (uint32_t));
+      default_arg_types = Arena_Allocate (missing * sizeof (LLVM_Rep));
+      for (uint32_t p = provided_count; p < sym->parameter_count; p++) {
+        Syntax_Node *def = sym->parameters[p].default_value;
+        if (not def) continue;  // not reachable for a legal call
+        Type_Info *pt = sym->parameters[p].param_type;
+        LLVM_Value dv = Generate_Expression (def);
+
+        // Composite IN defaults pass by reference. The formal's ABI rep
+        // (Type_To_Rep) decides the shape: fat { ptr, ptr } for unconstrained
+        // or dynamic-bounded arrays/strings, a plain data ptr otherwise. Match
+        // the value to that rep — extract field 0 when the callee wants a ptr
+        // but the default value (e.g. a string literal) is fat.
+        if (pt and Type_Is_Composite (pt)) {
+          LLVM_Rep param_rep = Type_To_Rep (pt);
+          uint32_t v = dv.reg;
+          if (LLVM_Rep_Is_Fat_Pointer (param_rep)) {
+            if (not LLVM_Rep_Is_Fat_Pointer (dv.rep))
+              v = Fat_Ptr_As_Value (v).reg;
+            default_arg_types[n_default_args] = LL_REP_FAT;
+          } else {
+            if (LLVM_Rep_Is_Fat_Pointer (dv.rep)) {
+              uint32_t dp = Emit_Temp ();
+              Emit ("  %%t%u = extractvalue " FAT_PTR_TYPE " %%t%u, 0\n", dp, v);
+              v = dp;
+            }
+            default_arg_types[n_default_args] = LL_REP_PTR;
+          }
+          default_arg_vals[n_default_args] = v;
+        } else {
+          LLVM_Rep dvt  = Expression_LLVM_Rep (def);
+          LLVM_Rep prep = pt ? Type_To_Rep (pt) : Integer_Arith_Rep ();
+          default_arg_vals[n_default_args]  = Emit_Convert (dv.reg, dvt, prep).reg;
+          default_arg_types[n_default_args] = prep;
+        }
+        n_default_args++;
+      }
     }
     uint32_t t = Emit_Temp ();
 
@@ -23040,6 +23095,13 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
           ? LLVM_Rep_To_String (Type_To_Rep (sym->parameters[i].param_type)) : LLVM_Rep_To_String (Integer_Arith_Rep ());
         Emit ("%s %%t%u", param_type, args[i]);
       }
+    }
+
+    // Trailing default arguments (RM 6.4.2), in formal order after actuals
+    for (uint32_t k = 0; k < n_default_args; k++) {
+      if (need_comma) Emit (", ");
+      need_comma = true;
+      Emit ("%s %%t%u", LLVM_Rep_To_String (default_arg_types[k]), default_arg_vals[k]);
     }
     Emit (")\n");
 
@@ -23247,10 +23309,10 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
     uint32_t entry_idx = Emit_Temp ();
     if (is_entry_family and family_idx_temp) {
       Emit ("  %%t%u = add %s %u, %%t%u  ; entry index (base + family)\n",
-         entry_idx, eidx_t, sym->entry_index * 1000, family_idx_temp);
+         entry_idx, LLVM_Rep_To_String (eidx_t), sym->entry_index * 1000, family_idx_temp);
     } else {
       Emit ("  %%t%u = add %s 0, %u  ; entry index (simple entry)\n",
-         entry_idx, eidx_t, sym->entry_index * 1000);
+         entry_idx, LLVM_Rep_To_String (eidx_t), sym->entry_index * 1000);
     }
 
     // Call runtime entry call function - extend entry index to i64 for RTS ABI
@@ -23366,14 +23428,17 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
 
     // Complex prefix (e.g., array field of indexed record)
     } else {
-      uint32_t prefix_val = Generate_Expression (node->apply.prefix).reg;
+      LLVM_Value prefix_v = Generate_Expression (node->apply.prefix);
+      uint32_t prefix_val = prefix_v.reg;
 
-      // If the array is unconstrained or has dynamic bounds, the expression                        
-      // returns a fat pointer struct { ptr, { bound, bound } }. We need to extract                 
-      // the data pointer and low bound from it.                                                   
-      // Extract data pointer from fat pointer value                                                
-      //                                                                                            
-      if (Type_Is_Unconstrained_Array (array_type) or Type_Has_Dynamic_Bounds (array_type)) {
+      // A fat-pointer value (slice, unconstrained/dynamic array, or fat
+      // function result) carries its data pointer and bounds inline and must
+      // be unpacked before indexing. Drive off the value's actual rep, not the
+      // static array_type — a slice of a constrained array reads as constrained
+      // yet still produces a { ptr, { bound, bound } } value.
+      //
+      if (LLVM_Rep_Is_Fat_Pointer (prefix_v.rep) or
+          Type_Is_Unconstrained_Array (array_type) or Type_Has_Dynamic_Bounds (array_type)) {
         LLVM_Rep pfx_bt = Array_Bound_LLVM_Rep (array_type);
         dyn_fat = prefix_val;
         base = Emit_Fat_Pointer_Data (prefix_val, pfx_bt).reg;
@@ -23436,10 +23501,10 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
       if (has_dynamic_low) {
         uint32_t low_bound_conv = Emit_Convert (low_bound_val, dyn_bt, sl_iat).reg;
         offset = Emit_Temp ();
-        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", offset, sl_iat, slice_low, low_bound_conv);
+        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", offset, LLVM_Rep_To_String (sl_iat), slice_low, low_bound_conv);
       } else if (array_low != 0) {
         offset = Emit_Temp ();
-        Emit ("  %%t%u = sub %s %%t%u, %s\n", offset, sl_iat, slice_low, I128_Decimal (array_low));
+        Emit ("  %%t%u = sub %s %%t%u, %s\n", offset, LLVM_Rep_To_String (sl_iat), slice_low, I128_Decimal (array_low));
       } else {
         offset = slice_low;
       }
@@ -23448,12 +23513,12 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
       uint32_t data_ptr = Emit_Temp ();
       if (elem_size == 1) {
         Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n",
-           data_ptr, base, sl_iat, offset);
+           data_ptr, base, LLVM_Rep_To_String (sl_iat), offset);
       } else {
         uint32_t byte_off = Emit_Temp ();
-        Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_off, sl_iat, offset, elem_size);
+        Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_off, LLVM_Rep_To_String (sl_iat), offset, elem_size);
         Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n",
-           data_ptr, base, sl_iat, byte_off);
+           data_ptr, base, LLVM_Rep_To_String (sl_iat), byte_off);
       }
 
       // Build fat pointer with slice bounds using helper
@@ -23607,7 +23672,7 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
     if (elem_is_fat) {
       LLVM_Rep iat_idx = Integer_Arith_Rep ();
       Emit ("  %%t%u = getelementptr %s, ptr %%t%u, %s %%t%u  ; &array[idx] (fat elem)\n", 
-            ptr, FAT_PTR_TYPE, base, iat_idx, flat_idx);
+            ptr, FAT_PTR_TYPE, base, LLVM_Rep_To_String (iat_idx), flat_idx);
       t = Emit_Temp ();
       Emit ("  %%t%u = load %s, ptr %%t%u  ; array[idx] fat\n", t, FAT_PTR_TYPE, ptr);
       return Val_Rep (t, LL_REP_FAT);
@@ -23623,7 +23688,7 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
       t = Emit_Temp ();
       LLVM_Rep iat_idx = Integer_Arith_Rep ();
       Emit ("  %%t%u = getelementptr %s, ptr %%t%u, %s %%t%u  ; &array[idx] (elem_type=%s)\n",
-            ptr, LLVM_Rep_To_String (elem_type), base, iat_idx, flat_idx, LLVM_Rep_To_String (elem_type));
+            ptr, LLVM_Rep_To_String (elem_type), base, LLVM_Rep_To_String (iat_idx), flat_idx, LLVM_Rep_To_String (elem_type));
       Emit ("  %%t%u = load %s, ptr %%t%u  ; array[idx]\n", t, LLVM_Rep_To_String (elem_type), ptr);
 
       // no widening at load - value stays at native type width.
@@ -23675,9 +23740,9 @@ type_conversion:
           int128_t hi = (src_type->kind == TYPE_ARRAY and src_type->array.index_count > 0)
             ? Type_Bound_Value (src_type->array.indices[0].high_bound) : lo;
           uint32_t lo_t = Emit_Temp ();
-          Emit ("  %%t%u = add %s 0, %s  ; array conv low bound\n", lo_t, bt, I128_Decimal (lo));
+          Emit ("  %%t%u = add %s 0, %s  ; array conv low bound\n", lo_t, LLVM_Rep_To_String (bt), I128_Decimal (lo));
           uint32_t hi_t = Emit_Temp ();
-          Emit ("  %%t%u = add %s 0, %s  ; array conv high bound\n", hi_t, bt, I128_Decimal (hi));
+          Emit ("  %%t%u = add %s 0, %s  ; array conv high bound\n", hi_t, LLVM_Rep_To_String (bt), I128_Decimal (hi));
           return Emit_Fat_Pointer_Dynamic (result, lo_t, hi_t, bt);
 
         // Fat pointer > flat alloca destination: extract data pointer.
@@ -23803,7 +23868,7 @@ type_conversion:
           uint32_t t2 = Emit_Temp ();
           LLVM_Rep dst_llvm = Type_To_Rep (dst_type);
           Emit ("  %%t%u = fptosi double %%t%u to %s  ; fixed>integer\n",
-             t2, f3, dst_llvm);
+             t2, f3, LLVM_Rep_To_String (dst_llvm));
           if (Type_Is_Scalar (dst_type))
             Emit_Constraint_Check_Val ((LLVM_Value){ t2, dst_llvm }, dst_type, src_type).reg;
           return Val_Rep (t2, dst_llvm);
@@ -23973,23 +24038,23 @@ LLVM_Value Generate_Selected (Syntax_Node *node) {
       if (vinfo->disc_value_low == vinfo->disc_value_high) {
         uint32_t expected = Emit_Temp ();
         Emit ("  %%t%u = add %s 0, %lld  ; expected discriminant\n",
-           expected, iat_disc, (long long)vinfo->disc_value_low);
+           expected, LLVM_Rep_To_String (iat_disc), (long long)vinfo->disc_value_low);
         Emit_Discriminant_Check (disc_val, expected, iat_disc, record_type);
 
       // Range: check disc_val in [low..high]
       } else {
         uint32_t lo = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, %lld\n", lo, iat_disc,
+        Emit ("  %%t%u = add %s 0, %lld\n", lo, LLVM_Rep_To_String (iat_disc),
            (long long)vinfo->disc_value_low);
         uint32_t hi = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, %lld\n", hi, iat_disc,
+        Emit ("  %%t%u = add %s 0, %lld\n", hi, LLVM_Rep_To_String (iat_disc),
            (long long)vinfo->disc_value_high);
         uint32_t cmp_lo = Emit_Temp ();
         Emit ("  %%t%u = icmp sge %s %%t%u, %%t%u\n",
-           cmp_lo, iat_disc, disc_val, lo);
+           cmp_lo, LLVM_Rep_To_String (iat_disc), disc_val, lo);
         uint32_t cmp_hi = Emit_Temp ();
         Emit ("  %%t%u = icmp sle %s %%t%u, %%t%u\n",
-           cmp_hi, iat_disc, disc_val, hi);
+           cmp_hi, LLVM_Rep_To_String (iat_disc), disc_val, hi);
         uint32_t in_range = Emit_Temp ();
         Emit ("  %%t%u = and i1 %%t%u, %%t%u\n",
            in_range, cmp_lo, cmp_hi);
@@ -24110,7 +24175,7 @@ LLVM_Value Generate_Selected (Syntax_Node *node) {
         if (lo_bnd->kind == BOUND_INTEGER) {
           lo_val = Emit_Temp ();
           Emit ("  %%t%u = add %s 0, %lld\n",
-             lo_val, bnd_type, (long long)lo_bnd->int_value);
+             lo_val, LLVM_Rep_To_String (bnd_type), (long long)lo_bnd->int_value);
         } else if (lo_bnd->kind == BOUND_EXPR and lo_bnd->expr and
                lo_bnd->expr->symbol) {
 
@@ -24128,10 +24193,10 @@ LLVM_Value Generate_Selected (Syntax_Node *node) {
           Emit ("  %%t%u = getelementptr i8, ptr %%t%u, i64 %u\n",
              dp, rec_base, d_off);
           lo_val = Emit_Temp ();
-          Emit ("  %%t%u = load %s, ptr %%t%u\n", lo_val, bnd_type, dp);
+          Emit ("  %%t%u = load %s, ptr %%t%u\n", lo_val, LLVM_Rep_To_String (bnd_type), dp);
         } else {
           lo_val = Emit_Temp ();
-          Emit ("  %%t%u = add %s 0, 1\n", lo_val, bnd_type);
+          Emit ("  %%t%u = add %s 0, 1\n", lo_val, LLVM_Rep_To_String (bnd_type));
         }
 
         // Emit high bound
@@ -24139,7 +24204,7 @@ LLVM_Value Generate_Selected (Syntax_Node *node) {
         if (hi_bnd->kind == BOUND_INTEGER) {
           hi_val = Emit_Temp ();
           Emit ("  %%t%u = add %s 0, %lld\n",
-             hi_val, bnd_type, (long long)hi_bnd->int_value);
+             hi_val, LLVM_Rep_To_String (bnd_type), (long long)hi_bnd->int_value);
         } else if (hi_bnd->kind == BOUND_EXPR and hi_bnd->expr and
                hi_bnd->expr->symbol) {
           Symbol *disc = hi_bnd->expr->symbol;
@@ -24155,23 +24220,23 @@ LLVM_Value Generate_Selected (Syntax_Node *node) {
           Emit ("  %%t%u = getelementptr i8, ptr %%t%u, i64 %u\n",
              dp, rec_base, d_off);
           hi_val = Emit_Temp ();
-          Emit ("  %%t%u = load %s, ptr %%t%u\n", hi_val, bnd_type, dp);
+          Emit ("  %%t%u = load %s, ptr %%t%u\n", hi_val, LLVM_Rep_To_String (bnd_type), dp);
         } else {
           hi_val = Emit_Temp ();
-          Emit ("  %%t%u = add %s 0, 0\n", hi_val, bnd_type);
+          Emit ("  %%t%u = add %s 0, 0\n", hi_val, LLVM_Rep_To_String (bnd_type));
         }
 
         // Store low bound at index xi*2
         uint32_t lo_ptr = Emit_Temp ();
         Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-           lo_ptr, bnd_type, bounds_alloca, xi * 2);
-        Emit ("  store %s %%t%u, ptr %%t%u\n", bnd_type, lo_val, lo_ptr);
+           lo_ptr, LLVM_Rep_To_String (bnd_type), bounds_alloca, xi * 2);
+        Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (bnd_type), lo_val, lo_ptr);
 
         // Store high bound at index xi*2+1
         uint32_t hi_ptr = Emit_Temp ();
         Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-           hi_ptr, bnd_type, bounds_alloca, xi * 2 + 1);
-        Emit ("  store %s %%t%u, ptr %%t%u\n", bnd_type, hi_val, hi_ptr);
+           hi_ptr, LLVM_Rep_To_String (bnd_type), bounds_alloca, xi * 2 + 1);
+        Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (bnd_type), hi_val, hi_ptr);
       }
 
       // Construct fat pointer { data_ptr, bounds_ptr }
@@ -24413,25 +24478,25 @@ LLVM_Value Emit_Bound_Attribute (uint32_t t,
           Emit ("  %%t%u = fadd double 0.0, 0x%016llX\n", st, (unsigned long long)sb);
           uint32_t dv = Emit_Temp ();
           Emit ("  %%t%u = fdiv double %%t%u, %%t%u\n", dv, fv, st);
-          Emit ("  %%t%u = fptosi double %%t%u to %s\n", t, dv, bound_s);
+          Emit ("  %%t%u = fptosi double %%t%u to %s\n", t, dv, LLVM_Rep_To_String (bound_s));
         } else {
           LLVM_Rep fv_src = LLVM_Rep_Is_Int (fv_rep) ? fv_rep : Type_To_Rep (b.expr->type);
           if (not LLVM_Rep_Is_Int (fv_src)) fv_src = bound_rep;
           if (LLVM_Rep_Equal (fv_src, bound_rep)) {
-            Emit ("  %%t%u = add %s 0, %%t%u\n", t, bound_s, fv);
+            Emit ("  %%t%u = add %s 0, %%t%u\n", t, LLVM_Rep_To_String (bound_s), fv);
           } else {
-            Emit ("  %%t%u = sext %s %%t%u to %s\n", t, LLVM_Rep_To_String (fv_src), fv, bound_s);
+            Emit ("  %%t%u = sext %s %%t%u to %s\n", t, LLVM_Rep_To_String (fv_src), fv, LLVM_Rep_To_String (bound_s));
           }
         }
       } else {
         double fval = Type_Bound_Float_Value (b);
         int64_t scaled = (int64_t)(fval / small);
         Emit ("  %%t%u = add %s 0, %lld  ; %.*s'%s (fixed scaled %g/small)\n", t,
-           bound_s, (long long)scaled, (int)attr.length, attr.data, tag, fval);
+           LLVM_Rep_To_String (bound_s), (long long)scaled, (int)attr.length, attr.data, tag, fval);
       }
     } else if (Type_Bound_Is_Compile_Time_Known (b)) {
       Emit ("  %%t%u = add %s 0, %s  ; %.*s'%s\n", t,
-         bound_s, I128_Decimal (Type_Bound_Value (b)), (int)attr.length, attr.data, tag);
+         LLVM_Rep_To_String (bound_s), I128_Decimal (Type_Bound_Value (b)), (int)attr.length, attr.data, tag);
     } else {
       return Generate_Bound_Value (b, bound_rep);
     }
@@ -24561,7 +24626,7 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
           uint32_t len = Emit_Length_Clamped (lo_t, hi_t, iat).reg;
 
           // Copy to result temp t
-          Emit ("  %%t%u = add %s %%t%u, 0  ; 'LENGTH (%u)\n", t, iat, len, dim+1);
+          Emit ("  %%t%u = add %s %%t%u, 0  ; 'LENGTH (%u)\n", t, LLVM_Rep_To_String (iat), len, dim+1);
         } else {
           int128_t low = Type_Bound_Value (lb);
           int128_t high = Type_Bound_Value (hb);
@@ -24875,12 +24940,12 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
       LLVM_Rep abs_type = Integer_Arith_Rep ();
       Type_Info *res_type = first_arg->type;
       uint32_t zero = Emit_Temp ();
-      Emit ("  %%t%u = add %s 0, 0\n", zero, abs_type);
-      uint32_t neg = Emit_Overflow_Checked_Op (zero, val, "sub", res_type).reg;
+      Emit ("  %%t%u = add %s 0, 0\n", zero, LLVM_Rep_To_String (abs_type));
+      uint32_t neg = Emit_Overflow_Checked_Op (zero, val, "sub", abs_type, res_type).reg;
       uint32_t cmp = Emit_Temp ();
-      Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", cmp, abs_type, val);
+      Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", cmp, LLVM_Rep_To_String (abs_type), val);
       Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u  ; 'ABS\n",
-         t, cmp, abs_type, neg, abs_type, val);
+         t, cmp, LLVM_Rep_To_String (abs_type), neg, LLVM_Rep_To_String (abs_type), val);
       return Val_Rep (t, Integer_Arith_Rep ());
     }
   }
@@ -24889,7 +24954,7 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
   if (Slice_Equal_Ignore_Case (attr, S("MOD"))) {
     if (prefix_type and prefix_type->kind == TYPE_MODULAR and prefix_type->modulus > 0) {
       LLVM_Rep mod_type = Type_To_Rep (prefix_type);
-      Emit ("  %%t%u = add %s 0, %s  ; 'MOD\n", t, mod_type,
+      Emit ("  %%t%u = add %s 0, %s  ; 'MOD\n", t, LLVM_Rep_To_String (mod_type),
          U128_Decimal (prefix_type->modulus));
       return Val_Rep (t, Integer_Arith_Rep ());
     }
@@ -25081,7 +25146,7 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
         // Integer'VALUE - parse string as integer
         LLVM_Rep val_iat = Integer_Arith_Rep ();
         Emit ("  %%t%u = call %s @__ada_integer_value(" FAT_PTR_TYPE " %%t%u)\n",
-           t, val_iat, str_val);
+           t, LLVM_Rep_To_String (val_iat), str_val);
 
         // Convert to prefix type width if different
         LLVM_Rep val_result_t = Type_To_Rep (prefix_type);
@@ -25103,22 +25168,22 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
         // Trim leading/trailing spaces
         uint32_t lead_off = Emit_Temp ();
         Emit ("  %%t%u = call %s @__ada_count_leading_spaces(ptr %%t%u, %s %%t%u)\n",
-           lead_off, val_iat, str_ptr_raw, val_iat, str_len_raw);
+           lead_off, LLVM_Rep_To_String (val_iat), str_ptr_raw, LLVM_Rep_To_String (val_iat), str_len_raw);
         uint32_t trail_off = Emit_Temp ();
         Emit ("  %%t%u = call %s @__ada_count_trailing_spaces(ptr %%t%u, %s %%t%u)\n",
-           trail_off, val_iat, str_ptr_raw, val_iat, str_len_raw);
+           trail_off, LLVM_Rep_To_String (val_iat), str_ptr_raw, LLVM_Rep_To_String (val_iat), str_len_raw);
         uint32_t str_ptr = Emit_Temp ();
         Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n",
-           str_ptr, str_ptr_raw, val_iat, lead_off);
+           str_ptr, str_ptr_raw, LLVM_Rep_To_String (val_iat), lead_off);
         uint32_t trim_total = Emit_Temp ();
-        Emit ("  %%t%u = add %s %%t%u, %%t%u\n", trim_total, val_iat, lead_off, trail_off);
+        Emit ("  %%t%u = add %s %%t%u, %%t%u\n", trim_total, LLVM_Rep_To_String (val_iat), lead_off, trail_off);
         uint32_t str_len = Emit_Temp ();
-        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", str_len, val_iat, str_len_raw, trim_total);
+        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", str_len, LLVM_Rep_To_String (val_iat), str_len_raw, trim_total);
         cg->needs_trim_helpers = true;
 
         // Must be exactly 3 chars: 'x'
         uint32_t len3 = Emit_Temp ();
-        Emit ("  %%t%u = icmp eq %s %%t%u, 3\n", len3, val_iat, str_len);
+        Emit ("  %%t%u = icmp eq %s %%t%u, 3\n", len3, LLVM_Rep_To_String (val_iat), str_len);
         uint32_t ok_label = cg->label_id++;
         uint32_t fail_label = cg->label_id++;
         uint32_t end_label = cg->label_id++;
@@ -25127,11 +25192,11 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
 
         // Check first and last chars are single quotes
         uint32_t c0_ptr = Emit_Temp ();
-        Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s 0\n", c0_ptr, str_ptr, val_iat);
+        Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s 0\n", c0_ptr, str_ptr, LLVM_Rep_To_String (val_iat));
         uint32_t c0 = Emit_Temp ();
         Emit ("  %%t%u = load i8, ptr %%t%u\n", c0, c0_ptr);
         uint32_t c2_ptr = Emit_Temp ();
-        Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s 2\n", c2_ptr, str_ptr, val_iat);
+        Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s 2\n", c2_ptr, str_ptr, LLVM_Rep_To_String (val_iat));
         uint32_t c2 = Emit_Temp ();
         Emit ("  %%t%u = load i8, ptr %%t%u\n", c2, c2_ptr);
         uint32_t q0 = Emit_Temp ();
@@ -25146,7 +25211,7 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
 
         // Extract the character at position 1
         uint32_t c1_ptr = Emit_Temp ();
-        Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s 1\n", c1_ptr, str_ptr, val_iat);
+        Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s 1\n", c1_ptr, str_ptr, LLVM_Rep_To_String (val_iat));
         uint32_t c1 = Emit_Temp ();
         Emit ("  %%t%u = load i8, ptr %%t%u\n", c1, c1_ptr);
         t = c1;
@@ -25168,17 +25233,17 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
         // Trim leading/trailing spaces
         uint32_t lead_off = Emit_Temp ();
         Emit ("  %%t%u = call %s @__ada_count_leading_spaces(ptr %%t%u, %s %%t%u)\n",
-           lead_off, val_iat, str_ptr_raw, val_iat, str_len_raw);
+           lead_off, LLVM_Rep_To_String (val_iat), str_ptr_raw, LLVM_Rep_To_String (val_iat), str_len_raw);
         uint32_t trail_off = Emit_Temp ();
         Emit ("  %%t%u = call %s @__ada_count_trailing_spaces(ptr %%t%u, %s %%t%u)\n",
-           trail_off, val_iat, str_ptr_raw, val_iat, str_len_raw);
+           trail_off, LLVM_Rep_To_String (val_iat), str_ptr_raw, LLVM_Rep_To_String (val_iat), str_len_raw);
         uint32_t str_ptr = Emit_Temp ();
         Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n",
-           str_ptr, str_ptr_raw, val_iat, lead_off);
+           str_ptr, str_ptr_raw, LLVM_Rep_To_String (val_iat), lead_off);
         uint32_t trim_total = Emit_Temp ();
-        Emit ("  %%t%u = add %s %%t%u, %%t%u\n", trim_total, val_iat, lead_off, trail_off);
+        Emit ("  %%t%u = add %s %%t%u, %%t%u\n", trim_total, LLVM_Rep_To_String (val_iat), lead_off, trail_off);
         uint32_t str_len = Emit_Temp ();
-        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", str_len, val_iat, str_len_raw, trim_total);
+        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", str_len, LLVM_Rep_To_String (val_iat), str_len_raw, trim_total);
         cg->needs_trim_helpers = true;
 
         // Check for "TRUE" (length 4) and "FALSE" (length 5)
@@ -25187,8 +25252,8 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
         uint32_t false_str_id = cg->string_id++;
         Emit_String_Const ("@.val_str%u = private unnamed_addr constant [6 x i8] c\"FALSE\\00\"\n", false_str_id);
         uint32_t result_alloc = Emit_Temp ();
-        Emit ("  %%t%u = alloca %s\n", result_alloc, val_iat);
-        Emit ("  store %s 0, ptr %%t%u\n", val_iat, result_alloc);
+        Emit ("  %%t%u = alloca %s\n", result_alloc, LLVM_Rep_To_String (val_iat));
+        Emit ("  store %s 0, ptr %%t%u\n", LLVM_Rep_To_String (val_iat), result_alloc);
         uint32_t check_true = cg->label_id++;
         uint32_t check_false_len = cg->label_id++;
         uint32_t check_false = cg->label_id++;
@@ -25199,7 +25264,7 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
 
         // Check length == 4 (TRUE)
         uint32_t len4 = Emit_Temp ();
-        Emit ("  %%t%u = icmp eq %s %%t%u, 4\n", len4, val_iat, str_len);
+        Emit ("  %%t%u = icmp eq %s %%t%u, 4\n", len4, LLVM_Rep_To_String (val_iat), str_len);
         Emit ("  br i1 %%t%u, label %%Lbval_ct%u, label %%Lbval_cfl%u\n", len4, check_true, check_false_len);
         Emit ("Lbval_ct%u:\n", check_true);
         uint32_t cmp_true = Emit_Temp ();
@@ -25209,13 +25274,13 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
         Emit ("  %%t%u = icmp eq i32 %%t%u, 0\n", is_true, cmp_true);
         Emit ("  br i1 %%t%u, label %%Lbval_mt%u, label %%Lbval_cfl%u\n", is_true, match_true, check_false_len);
         Emit ("Lbval_mt%u:\n", match_true);
-        Emit ("  store %s 1, ptr %%t%u\n", val_iat, result_alloc);
+        Emit ("  store %s 1, ptr %%t%u\n", LLVM_Rep_To_String (val_iat), result_alloc);
         Emit ("  br label %%Lbval_end%u\n", end_label);
 
         // Check length == 5 (FALSE)
         Emit ("Lbval_cfl%u:\n", check_false_len);
         uint32_t len5 = Emit_Temp ();
-        Emit ("  %%t%u = icmp eq %s %%t%u, 5\n", len5, val_iat, str_len);
+        Emit ("  %%t%u = icmp eq %s %%t%u, 5\n", len5, LLVM_Rep_To_String (val_iat), str_len);
         Emit ("  br i1 %%t%u, label %%Lbval_cf%u, label %%Lbval_nm%u\n", len5, check_false, no_match);
         Emit ("Lbval_cf%u:\n", check_false);
         uint32_t cmp_false = Emit_Temp ();
@@ -25225,7 +25290,7 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
         Emit ("  %%t%u = icmp eq i32 %%t%u, 0\n", is_false, cmp_false);
         Emit ("  br i1 %%t%u, label %%Lbval_mf%u, label %%Lbval_nm%u\n", is_false, match_false, no_match);
         Emit ("Lbval_mf%u:\n", match_false);
-        Emit ("  store %s 0, ptr %%t%u\n", val_iat, result_alloc);
+        Emit ("  store %s 0, ptr %%t%u\n", LLVM_Rep_To_String (val_iat), result_alloc);
         Emit ("  br label %%Lbval_end%u\n", end_label);
 
         // No match - raise CONSTRAINT_ERROR
@@ -25261,25 +25326,25 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
           // Trim leading/trailing spaces via runtime helpers (Ada RM 3.5)
           uint32_t lead_off = Emit_Temp ();
           Emit ("  %%t%u = call %s @__ada_count_leading_spaces(ptr %%t%u, %s %%t%u)\n",
-             lead_off, val_iat, str_ptr_raw, val_iat, str_len_raw);
+             lead_off, LLVM_Rep_To_String (val_iat), str_ptr_raw, LLVM_Rep_To_String (val_iat), str_len_raw);
 
           // Backward scan for trailing spaces
           uint32_t trail_off = Emit_Temp ();
           Emit ("  %%t%u = call %s @__ada_count_trailing_spaces(ptr %%t%u, %s %%t%u)\n",
-             trail_off, val_iat, str_ptr_raw, val_iat, str_len_raw);
+             trail_off, LLVM_Rep_To_String (val_iat), str_ptr_raw, LLVM_Rep_To_String (val_iat), str_len_raw);
 
           // Trimmed pointer and length
           uint32_t str_ptr = Emit_Temp ();
           Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n",
-             str_ptr, str_ptr_raw, val_iat, lead_off);
+             str_ptr, str_ptr_raw, LLVM_Rep_To_String (val_iat), lead_off);
           uint32_t trim_total = Emit_Temp ();
-          Emit ("  %%t%u = add %s %%t%u, %%t%u\n", trim_total, val_iat, lead_off, trail_off);
+          Emit ("  %%t%u = add %s %%t%u, %%t%u\n", trim_total, LLVM_Rep_To_String (val_iat), lead_off, trail_off);
           uint32_t str_len = Emit_Temp ();
-          Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", str_len, val_iat, str_len_raw, trim_total);
+          Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", str_len, LLVM_Rep_To_String (val_iat), str_len_raw, trim_total);
           cg->needs_trim_helpers = true;
           uint32_t result_alloc = Emit_Temp ();
-          Emit ("  %%t%u = alloca %s\n", result_alloc, val_iat);
-          Emit ("  store %s 0, ptr %%t%u\n", val_iat, result_alloc);
+          Emit ("  %%t%u = alloca %s\n", result_alloc, LLVM_Rep_To_String (val_iat));
+          Emit ("  store %s 0, ptr %%t%u\n", LLVM_Rep_To_String (val_iat), result_alloc);
           uint32_t end_label = cg->label_id++;
           for (uint32_t i = 0; i < enum_type->enumeration.literal_count; i++) {
             String_Slice lit = enum_type->enumeration.literals[i];
@@ -25300,7 +25365,7 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
 
             // Check trimmed length matches literal
             uint32_t len_cmp = Emit_Temp ();
-            Emit ("  %%t%u = icmp eq %s %%t%u, %u\n", len_cmp, val_iat, str_len, (unsigned)lit.length);
+            Emit ("  %%t%u = icmp eq %s %%t%u, %u\n", len_cmp, LLVM_Rep_To_String (val_iat), str_len, (unsigned)lit.length);
             Emit ("  br i1 %%t%u, label %%Lval%u, label %%Lval_next%u\n", len_cmp, check_label, next_label);
             Emit ("Lval%u:\n", check_label);
             uint32_t cmp_result = Emit_Temp ();
@@ -25320,7 +25385,7 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
             uint32_t match_label = cg->label_id++;
             Emit ("  br i1 %%t%u, label %%Lval_match%u, label %%Lval_next%u\n", cmp_eq, match_label, next_label);
             Emit ("Lval_match%u:\n", match_label);
-            Emit ("  store %s %u, ptr %%t%u\n", val_iat, i, result_alloc);
+            Emit ("  store %s %u, ptr %%t%u\n", LLVM_Rep_To_String (val_iat), i, result_alloc);
             Emit ("  br label %%Lval_end%u\n", end_label);
             Emit ("Lval_next%u:\n", next_label);
           }
@@ -25340,7 +25405,7 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
         } else {
           LLVM_Rep fb_iat = Integer_Arith_Rep ();
           Emit ("  %%t%u = call %s @__ada_integer_value(" FAT_PTR_TYPE " %%t%u)\n",
-             t, fb_iat, str_val);
+             t, LLVM_Rep_To_String (fb_iat), str_val);
           LLVM_Rep fb_result_t = Type_To_Rep (prefix_type);
           return Emit_Convert (t, fb_iat, fb_result_t);
         }
@@ -25349,7 +25414,7 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
       } else {
         LLVM_Rep def_iat = Integer_Arith_Rep ();
         Emit ("  %%t%u = call %s @__ada_integer_value(" FAT_PTR_TYPE " %%t%u)\n",
-           t, def_iat, str_val);
+           t, LLVM_Rep_To_String (def_iat), str_val);
         LLVM_Rep def_result_t = Type_To_Rep (prefix_type);
         return Emit_Convert (t, def_iat, def_result_t);
       }
@@ -26130,7 +26195,7 @@ uint32_t Agg_Resolve_Elem (Syntax_Node *expr,
          st, (unsigned long long)sb);
       uint32_t dv = Emit_Temp ();
       Emit ("  %%t%u = fdiv %s %%t%u, %%t%u  ; /small\n",
-         dv, src_type, val, st);
+         dv, LLVM_Rep_To_String (src_type), val, st);
       val = dv;
     }
     val = Emit_Convert (val, src_type, elem_type).reg;
@@ -26228,12 +26293,12 @@ void Emit_Comp_Disc_Check (uint32_t ptr,
     Emit ("  %%t%u = getelementptr i8, ptr %%t%u, i64 %u\n",
        dp, ptr, dc->byte_offset);
     uint32_t dv = Emit_Temp ();
-    Emit ("  %%t%u = load %s, ptr %%t%u\n", dv, dt, dp);
+    Emit ("  %%t%u = load %s, ptr %%t%u\n", dv, LLVM_Rep_To_String (dt), dp);
     uint32_t exp_v = Emit_Disc_Constraint_Value (comp_ti, di, dt).reg;
     if (exp_v == 0)
       exp_v = Emit_Static_Int (0, dt).reg;
     uint32_t ne = Emit_Temp ();
-    Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne, dt, dv, exp_v);
+    Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne, LLVM_Rep_To_String (dt), dv, exp_v);
     uint32_t ok_l = cg->label_id++;
     uint32_t fl_l = cg->label_id++;
     Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n", ne, fl_l, ok_l);
@@ -26291,9 +26356,9 @@ void Emit_Inner_Consistency_Track (
   Emit_Label_Here (st_lbl);
   for (int d = 0; d < n_child; d++) {
     Emit ("  store %s %%t%u, ptr %%t%u\n",
-       bt, child_lo[d], inner_trk_lo[d]);
+       LLVM_Rep_To_String (bt), child_lo[d], inner_trk_lo[d]);
     Emit ("  store %s %%t%u, ptr %%t%u\n",
-       bt, child_hi[d], inner_trk_hi[d]);
+       LLVM_Rep_To_String (bt), child_hi[d], inner_trk_hi[d]);
   }
   Emit ("  store i1 1, ptr %%t%u\n", inner_trk_first);
   Emit ("  br label %%L%u\n", dn_lbl);
@@ -26305,16 +26370,16 @@ void Emit_Inner_Consistency_Track (
   for (int d = 0; d < n_child; d++) {
     uint32_t elo = Emit_Temp ();
     Emit ("  %%t%u = load %s, ptr %%t%u\n",
-       elo, bt, inner_trk_lo[d]);
+       elo, LLVM_Rep_To_String (bt), inner_trk_lo[d]);
     uint32_t ehi = Emit_Temp ();
     Emit ("  %%t%u = load %s, ptr %%t%u\n",
-       ehi, bt, inner_trk_hi[d]);
+       ehi, LLVM_Rep_To_String (bt), inner_trk_hi[d]);
     uint32_t nl = Emit_Temp ();
     Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-       nl, bt, child_lo[d], elo);
+       nl, LLVM_Rep_To_String (bt), child_lo[d], elo);
     uint32_t nh = Emit_Temp ();
     Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-       nh, bt, child_hi[d], ehi);
+       nh, LLVM_Rep_To_String (bt), child_hi[d], ehi);
     uint32_t dim_mm = Emit_Temp ();
     Emit ("  %%t%u = or i1 %%t%u, %%t%u\n", dim_mm, nl, nh);
     if (accum == 0) {
@@ -26476,7 +26541,7 @@ void Agg_Rec_Disc_Post (LLVM_Value val_in, Component_Info *comp, uint32_t disc_o
   for (uint32_t i = 0; i < da_info->count; i++) {
     if (Slice_Equal_Ignore_Case (da_info->entries[i].sym->name, comp->name)) {
       Emit ("  store %s %%t%u, ptr %%t%u\n",
-         dt, val, da_info->entries[i].temp);
+         LLVM_Rep_To_String (dt), val, da_info->entries[i].temp);
       break;
     }
   }
@@ -26494,7 +26559,7 @@ void Agg_Rec_Disc_Post (LLVM_Value val_in, Component_Info *comp, uint32_t disc_o
     if (exp_v == 0) exp_v = Emit_Static_Int (0, dt).reg;
   }
   uint32_t ne = Emit_Temp ();
-  Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne, dt, val, exp_v);
+  Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne, LLVM_Rep_To_String (dt), val, exp_v);
   uint32_t ok_l = cg->label_id++, fl_l = cg->label_id++;
   Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n", ne, fl_l, ok_l);
   cg->block_terminated = true;
@@ -26936,7 +27001,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
           else {
             uint32_t prod = Emit_Temp ();
             Emit ("  %%t%u = mul %s %%t%u, %%t%u\n",
-               prod, iat_bnd, rt_row_elems, dim_len);
+               prod, LLVM_Rep_To_String (iat_bnd), rt_row_elems, dim_len);
             rt_row_elems = prod;
           }
         }
@@ -26965,7 +27030,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
               uint32_t nc = Emit_Temp ();
               Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u"
                  "  ; inner dim %u null?\n",
-                 nc, iat_bnd, rt_inner_lo[d], rt_inner_hi[d], d);
+                 nc, LLVM_Rep_To_String (iat_bnd), rt_inner_lo[d], rt_inner_hi[d], d);
               uint32_t sk = cg->label_id++;
               uint32_t ck = cg->label_id++;
               Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
@@ -26989,15 +27054,15 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
                    agg_type->array.element_type->size : 8;
         if (scalar_sz == 0) scalar_sz = 8;
         Emit ("  %%t%u = mul %s %%t%u, %u  ; row byte size\n",
-           raw_row_size, iat_bnd, rt_row_elems, scalar_sz);
+           raw_row_size, LLVM_Rep_To_String (iat_bnd), rt_row_elems, scalar_sz);
 
         // Clamp to >= 0: null inner ranges produce negative sizes
         uint32_t neg = Emit_Temp ();
         Emit ("  %%t%u = icmp slt %s %%t%u, 0\n",
-           neg, iat_bnd, raw_row_size);
+           neg, LLVM_Rep_To_String (iat_bnd), raw_row_size);
         rt_row_size = Emit_Temp ();
         Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n",
-           rt_row_size, neg, iat_bnd, iat_bnd, raw_row_size);
+           rt_row_size, neg, LLVM_Rep_To_String (iat_bnd), LLVM_Rep_To_String (iat_bnd), raw_row_size);
       }
 
       // Calculate count and byte size
@@ -27008,23 +27073,23 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
       if (rt_row_size) {
         byte_size = Emit_Temp ();
         Emit ("  %%t%u = mul %s %%t%u, %%t%u\n",
-           byte_size, iat_bnd, count_plus1, rt_row_size);
+           byte_size, LLVM_Rep_To_String (iat_bnd), count_plus1, rt_row_size);
       } else {
         byte_size = Emit_Temp ();
         Emit ("  %%t%u = mul %s %%t%u, %u\n",
-           byte_size, iat_bnd, count_plus1, elem_size);
+           byte_size, LLVM_Rep_To_String (iat_bnd), count_plus1, elem_size);
       }
 
       // Clamp byte_size to 0 for null ranges (RM 3.6.1)
       uint32_t neg_chk = Emit_Temp ();
-      Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg_chk, iat_bnd, byte_size);
+      Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg_chk, LLVM_Rep_To_String (iat_bnd), byte_size);
       uint32_t clamped = Emit_Temp ();
       Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n",
-         clamped, neg_chk, iat_bnd, iat_bnd, byte_size);
+         clamped, neg_chk, LLVM_Rep_To_String (iat_bnd), LLVM_Rep_To_String (iat_bnd), byte_size);
 
       // Dynamic stack allocation
       uint32_t base = Emit_Temp ();
-      Emit ("  %%t%u = alloca i8, %s %%t%u  ; dynamic array aggregate\n", base, iat_bnd, clamped);
+      Emit ("  %%t%u = alloca i8, %s %%t%u  ; dynamic array aggregate\n", base, LLVM_Rep_To_String (iat_bnd), clamped);
 
       // Classify items: find OTHERS clause (value generated in loop below)
       Agg_Class ac = ac_early;  // reuse early classification
@@ -27083,13 +27148,13 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
               uint32_t n_pos = Emit_Static_Int ((int128_t)ac.n_positional, ait).reg;
               uint32_t con_len = Emit_Temp ();
               Emit ("  %%t%u = sub %s %%t%u, %%t%u\n",
-                 con_len, ait, chi, clo);
+                 con_len, LLVM_Rep_To_String (ait), chi, clo);
               uint32_t con_cnt = Emit_Temp ();
               Emit ("  %%t%u = add %s %%t%u, 1\n",
-                 con_cnt, ait, con_len);
+                 con_cnt, LLVM_Rep_To_String (ait), con_len);
               uint32_t mismatch = Emit_Temp ();
               Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-                 mismatch, ait, n_pos, con_cnt);
+                 mismatch, LLVM_Rep_To_String (ait), n_pos, con_cnt);
               uint32_t ok_lbl = cg->label_id++;
               uint32_t fail_lbl = cg->label_id++;
               Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
@@ -27115,7 +27180,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
               uint32_t con_lo = Emit_Single_Bound (&agg_type->array.indices[0].low_bound, ait);
               uint32_t ne = Emit_Temp ();
               Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-                 ne, ait, isf, con_lo);
+                 ne, LLVM_Rep_To_String (ait), isf, con_lo);
               uint32_t ok2 = cg->label_id++;
               uint32_t fail2 = cg->label_id++;
               Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
@@ -27160,9 +27225,9 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
               uint32_t clo = Emit_Convert (low_val, Integer_Arith_Rep (), ait).reg;
               uint32_t chi = Emit_Convert (high_val, Integer_Arith_Rep (), ait).reg;
               uint32_t ne_lo = Emit_Temp ();
-              Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne_lo, ait, nclo, clo);
+              Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne_lo, LLVM_Rep_To_String (ait), nclo, clo);
               uint32_t ne_hi = Emit_Temp ();
-              Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne_hi, ait, nchi, chi);
+              Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne_hi, LLVM_Rep_To_String (ait), nchi, chi);
               uint32_t mismatch = Emit_Temp ();
               Emit ("  %%t%u = or i1 %%t%u, %%t%u\n", mismatch, ne_lo, ne_hi);
               uint32_t ok_lbl = cg->label_id++;
@@ -27199,7 +27264,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
             : Emit_Coerce_Val (Emit_Bound_Value (&idx_ty->low_bound), ait).reg;
           uint32_t con_lo = Emit_Single_Bound (&agg_type->array.indices[0].low_bound, ait);
           uint32_t ne = Emit_Temp ();
-          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne, ait, isf, con_lo);
+          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne, LLVM_Rep_To_String (ait), isf, con_lo);
           uint32_t ok_p = cg->label_id++;
           uint32_t fail_p = cg->label_id++;
           Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
@@ -27270,7 +27335,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
           if (not ecomp and elem_ti and Type_Is_Scalar (elem_ti))
             val = Emit_Constraint_Check_Val ((LLVM_Value){ val, elem_type }, elem_ti, item->type).reg;
           uint32_t pidx = Emit_Temp ();
-          Emit ("  %%t%u = add %s 0, %u\n", pidx, ait, positional_idx);
+          Emit ("  %%t%u = add %s 0, %u\n", pidx, LLVM_Rep_To_String (ait), positional_idx);
           Agg_Store_At_Dynamic (base, val, pidx, ait,
             elem_type, elem_size, rt_row_size, ecomp);
           positional_idx++;
@@ -27289,14 +27354,14 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
         LLVM_Rep ait = Integer_Arith_Rep ();
         agg_bnd_lo_var = Emit_Temp ();
         Emit ("  %%t%u = alloca %s  ; track agg min-low\n",
-           agg_bnd_lo_var, ait);
+           agg_bnd_lo_var, LLVM_Rep_To_String (ait));
         uint32_t il = Emit_Static_Int (2147483647LL, ait).reg;
-        Emit ("  store %s %%t%u, ptr %%t%u\n", ait, il, agg_bnd_lo_var);
+        Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (ait), il, agg_bnd_lo_var);
         agg_bnd_hi_var = Emit_Temp ();
         Emit ("  %%t%u = alloca %s  ; track agg max-high\n",
-           agg_bnd_hi_var, ait);
+           agg_bnd_hi_var, LLVM_Rep_To_String (ait));
         uint32_t ih = Emit_Static_Int ((int128_t)-2147483648LL, ait).reg;
-        Emit ("  store %s %%t%u, ptr %%t%u\n", ait, ih, agg_bnd_hi_var);
+        Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (ait), ih, agg_bnd_hi_var);
       }
 
       // For dynamic aggregates with named range association (1..H1 => val),
@@ -27351,26 +27416,26 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
             if (track_named_bounds) {
               uint32_t cl = Emit_Temp ();
               Emit ("  %%t%u = load %s, ptr %%t%u\n",
-                 cl, agg_idx_type, agg_bnd_lo_var);
+                 cl, LLVM_Rep_To_String (agg_idx_type), agg_bnd_lo_var);
               uint32_t lt = Emit_Temp ();
               Emit ("  %%t%u = icmp slt %s %%t%u, %%t%u\n",
-                 lt, agg_idx_type, rng_low_val, cl);
+                 lt, LLVM_Rep_To_String (agg_idx_type), rng_low_val, cl);
               uint32_t nl = Emit_Temp ();
               Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u\n",
-                 nl, lt, agg_idx_type, rng_low_val, agg_idx_type, cl);
+                 nl, lt, LLVM_Rep_To_String (agg_idx_type), rng_low_val, LLVM_Rep_To_String (agg_idx_type), cl);
               Emit ("  store %s %%t%u, ptr %%t%u\n",
-                 agg_idx_type, nl, agg_bnd_lo_var);
+                 LLVM_Rep_To_String (agg_idx_type), nl, agg_bnd_lo_var);
               uint32_t ch = Emit_Temp ();
               Emit ("  %%t%u = load %s, ptr %%t%u\n",
-                 ch, agg_idx_type, agg_bnd_hi_var);
+                 ch, LLVM_Rep_To_String (agg_idx_type), agg_bnd_hi_var);
               uint32_t gt = Emit_Temp ();
               Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u\n",
-                 gt, agg_idx_type, rng_high_val, ch);
+                 gt, LLVM_Rep_To_String (agg_idx_type), rng_high_val, ch);
               uint32_t nh = Emit_Temp ();
               Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u\n",
-                 nh, gt, agg_idx_type, rng_high_val, agg_idx_type, ch);
+                 nh, gt, LLVM_Rep_To_String (agg_idx_type), rng_high_val, LLVM_Rep_To_String (agg_idx_type), ch);
               Emit ("  store %s %%t%u, ptr %%t%u\n",
-                 agg_idx_type, nh, agg_bnd_hi_var);
+                 LLVM_Rep_To_String (agg_idx_type), nh, agg_bnd_hi_var);
             }
 
             // RM 4.3.2(3): non-null range choice bounds must                                       
@@ -27394,7 +27459,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
                 uint32_t null_cmp = Emit_Temp ();
                 Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u"
                      "  ; null range?\n",
-                   null_cmp, agg_idx_type, rng_low_val, rng_high_val);
+                   null_cmp, LLVM_Rep_To_String (agg_idx_type), rng_low_val, rng_high_val);
                 uint32_t skip_lbl = cg->label_id++;
                 uint32_t chk_lbl  = cg->label_id++;
                 Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
@@ -27415,8 +27480,8 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
             Type_Info *elem_ti = agg_type->array.element_type;
             bool ecomp = Agg_Elem_Is_Composite (elem_ti, multidim);
             uint32_t loop_var = Emit_Temp ();
-            Emit ("  %%t%u = alloca %s\n", loop_var, agg_idx_type);
-            Emit ("  store %s %%t%u, ptr %%t%u\n", agg_idx_type, rng_low_val, loop_var);
+            Emit ("  %%t%u = alloca %s\n", loop_var, LLVM_Rep_To_String (agg_idx_type));
+            Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (agg_idx_type), rng_low_val, loop_var);
             uint32_t loop_start = cg->label_id++;
             uint32_t loop_body = cg->label_id++;
             uint32_t loop_end = cg->label_id++;
@@ -27424,9 +27489,9 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
             cg->block_terminated = true;
             Emit_Label_Here (loop_start);
             uint32_t cur_idx = Emit_Temp ();
-            Emit ("  %%t%u = load %s, ptr %%t%u\n", cur_idx, agg_idx_type, loop_var);
+            Emit ("  %%t%u = load %s, ptr %%t%u\n", cur_idx, LLVM_Rep_To_String (agg_idx_type), loop_var);
             uint32_t cmp = Emit_Temp ();
-            Emit ("  %%t%u = icmp sle %s %%t%u, %%t%u\n", cmp, agg_idx_type, cur_idx, rng_high_val);
+            Emit ("  %%t%u = icmp sle %s %%t%u, %%t%u\n", cmp, LLVM_Rep_To_String (agg_idx_type), cur_idx, rng_high_val);
             Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n", cmp, loop_body, loop_end);
             cg->block_terminated = true;
             Emit_Label_Here (loop_body);
@@ -27443,14 +27508,14 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
                 Array_Bound_LLVM_Rep (agg_type));
             uint32_t arr_idx = Emit_Temp ();
             Emit ("  %%t%u = sub %s %%t%u, %%t%u\n",
-               arr_idx, agg_idx_type, cur_idx, low_val);
+               arr_idx, LLVM_Rep_To_String (agg_idx_type), cur_idx, low_val);
             Agg_Store_At_Dynamic (base, val, arr_idx,
               agg_idx_type, elem_type, elem_size, rt_row_size, ecomp);
 
             // Increment and loop
             uint32_t next_idx = Emit_Temp ();
-            Emit ("  %%t%u = add %s %%t%u, 1\n", next_idx, agg_idx_type, cur_idx);
-            Emit ("  store %s %%t%u, ptr %%t%u\n", agg_idx_type, next_idx, loop_var);
+            Emit ("  %%t%u = add %s %%t%u, 1\n", next_idx, LLVM_Rep_To_String (agg_idx_type), cur_idx);
+            Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (agg_idx_type), next_idx, loop_var);
             Emit ("  br label %%L%u\n", loop_start);
             cg->block_terminated = true;
             Emit_Label_Here (loop_end);
@@ -27467,26 +27532,26 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
             if (track_named_bounds) {
               uint32_t cl = Emit_Temp ();
               Emit ("  %%t%u = load %s, ptr %%t%u\n",
-                 cl, agg_idx_type, agg_bnd_lo_var);
+                 cl, LLVM_Rep_To_String (agg_idx_type), agg_bnd_lo_var);
               uint32_t lt = Emit_Temp ();
               Emit ("  %%t%u = icmp slt %s %%t%u, %%t%u\n",
-                 lt, agg_idx_type, idx_val, cl);
+                 lt, LLVM_Rep_To_String (agg_idx_type), idx_val, cl);
               uint32_t nl = Emit_Temp ();
               Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u\n",
-                 nl, lt, agg_idx_type, idx_val, agg_idx_type, cl);
+                 nl, lt, LLVM_Rep_To_String (agg_idx_type), idx_val, LLVM_Rep_To_String (agg_idx_type), cl);
               Emit ("  store %s %%t%u, ptr %%t%u\n",
-                 agg_idx_type, nl, agg_bnd_lo_var);
+                 LLVM_Rep_To_String (agg_idx_type), nl, agg_bnd_lo_var);
               uint32_t ch = Emit_Temp ();
               Emit ("  %%t%u = load %s, ptr %%t%u\n",
-                 ch, agg_idx_type, agg_bnd_hi_var);
+                 ch, LLVM_Rep_To_String (agg_idx_type), agg_bnd_hi_var);
               uint32_t gt = Emit_Temp ();
               Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u\n",
-                 gt, agg_idx_type, idx_val, ch);
+                 gt, LLVM_Rep_To_String (agg_idx_type), idx_val, ch);
               uint32_t nh = Emit_Temp ();
               Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u\n",
-                 nh, gt, agg_idx_type, idx_val, agg_idx_type, ch);
+                 nh, gt, LLVM_Rep_To_String (agg_idx_type), idx_val, LLVM_Rep_To_String (agg_idx_type), ch);
               Emit ("  store %s %%t%u, ptr %%t%u\n",
-                 agg_idx_type, nh, agg_bnd_hi_var);
+                 LLVM_Rep_To_String (agg_idx_type), nh, agg_bnd_hi_var);
             }
             Type_Info *elem_ti = agg_type->array.element_type;
             bool ecomp = Agg_Elem_Is_Composite (elem_ti, multidim);
@@ -27501,7 +27566,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
                 Array_Bound_LLVM_Rep (agg_type));
             uint32_t arr_idx = Emit_Temp ();
             Emit ("  %%t%u = sub %s %%t%u, %%t%u\n",
-               arr_idx, agg_idx_type, idx_val, low_val);
+               arr_idx, LLVM_Rep_To_String (agg_idx_type), idx_val, low_val);
             Agg_Store_At_Dynamic (base, val, arr_idx,
               agg_idx_type, elem_type, elem_size, rt_row_size, ecomp);
           }
@@ -27516,16 +27581,16 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
         LLVM_Rep ait = Integer_Arith_Rep ();
         uint32_t fl = Emit_Temp ();
         Emit ("  %%t%u = load %s, ptr %%t%u\n",
-           fl, ait, agg_bnd_lo_var);
+           fl, LLVM_Rep_To_String (ait), agg_bnd_lo_var);
         uint32_t fh = Emit_Temp ();
         Emit ("  %%t%u = load %s, ptr %%t%u\n",
-           fh, ait, agg_bnd_hi_var);
+           fh, LLVM_Rep_To_String (ait), agg_bnd_hi_var);
         uint32_t ne_lo = Emit_Temp ();
         Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-           ne_lo, ait, fl, low_val);
+           ne_lo, LLVM_Rep_To_String (ait), fl, low_val);
         uint32_t ne_hi = Emit_Temp ();
         Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-           ne_hi, ait, fh, high_val);
+           ne_hi, LLVM_Rep_To_String (ait), fh, high_val);
         uint32_t mismatch = Emit_Temp ();
         Emit ("  %%t%u = or i1 %%t%u, %%t%u\n",
            mismatch, ne_lo, ne_hi);
@@ -27572,10 +27637,10 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
             uint32_t exp_hi = Emit_Single_Bound (&dim_hi[1], ait);
             uint32_t ilo_ne = Emit_Temp ();
             Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-               ilo_ne, ait, ir_lo, exp_lo);
+               ilo_ne, LLVM_Rep_To_String (ait), ir_lo, exp_lo);
             uint32_t ihi_ne = Emit_Temp ();
             Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-               ihi_ne, ait, ir_hi, exp_hi);
+               ihi_ne, LLVM_Rep_To_String (ait), ir_hi, exp_hi);
             uint32_t imm = Emit_Temp ();
             Emit ("  %%t%u = or i1 %%t%u, %%t%u\n",
                imm, ilo_ne, ihi_ne);
@@ -27606,7 +27671,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
         if (n_positional > 0) {
           start_val = Emit_Temp ();
           Emit ("  %%t%u = add %s %%t%u, %u  ; skip %u positional\n",
-             start_val, oth_idx_type, low_val, n_positional, n_positional);
+             start_val, LLVM_Rep_To_String (oth_idx_type), low_val, n_positional, n_positional);
         } else {
           start_val = low_val;
         }
@@ -27622,8 +27687,8 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
           }
         }
         uint32_t loop_var = Emit_Temp ();
-        Emit ("  %%t%u = alloca %s\n", loop_var, oth_idx_type);
-        Emit ("  store %s %%t%u, ptr %%t%u\n", oth_idx_type, start_val, loop_var);
+        Emit ("  %%t%u = alloca %s\n", loop_var, LLVM_Rep_To_String (oth_idx_type));
+        Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (oth_idx_type), start_val, loop_var);
         uint32_t loop_start = cg->label_id++;
         uint32_t loop_body = cg->label_id++;
         uint32_t loop_end = cg->label_id++;
@@ -27631,9 +27696,9 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
         cg->block_terminated = true;
         Emit_Label_Here (loop_start);
         uint32_t cur_idx = Emit_Temp ();
-        Emit ("  %%t%u = load %s, ptr %%t%u\n", cur_idx, oth_idx_type, loop_var);
+        Emit ("  %%t%u = load %s, ptr %%t%u\n", cur_idx, LLVM_Rep_To_String (oth_idx_type), loop_var);
         uint32_t cmp = Emit_Temp ();
-        Emit ("  %%t%u = icmp sle %s %%t%u, %%t%u\n", cmp, oth_idx_type, cur_idx, high_val);
+        Emit ("  %%t%u = icmp sle %s %%t%u, %%t%u\n", cmp, LLVM_Rep_To_String (oth_idx_type), cur_idx, high_val);
         Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n", cmp, loop_body, loop_end);
         cg->block_terminated = true;
         Emit_Label_Here (loop_body);
@@ -27645,12 +27710,12 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
           : others_val;
         uint32_t arr_idx = Emit_Temp ();
         Emit ("  %%t%u = sub %s %%t%u, %%t%u\n",
-           arr_idx, oth_idx_type, cur_idx, low_val);
+           arr_idx, LLVM_Rep_To_String (oth_idx_type), cur_idx, low_val);
         Agg_Store_At_Dynamic (base, loop_others_val, arr_idx,
           oth_idx_type, elem_type, elem_size, rt_row_size, ecomp);
         uint32_t next_idx = Emit_Temp ();
-        Emit ("  %%t%u = add %s %%t%u, 1\n", next_idx, oth_idx_type, cur_idx);
-        Emit ("  store %s %%t%u, ptr %%t%u\n", oth_idx_type, next_idx, loop_var);
+        Emit ("  %%t%u = add %s %%t%u, 1\n", next_idx, LLVM_Rep_To_String (oth_idx_type), cur_idx);
+        Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (oth_idx_type), next_idx, loop_var);
         Emit ("  br label %%L%u\n", loop_start);
         cg->block_terminated = true;
         Emit_Label_Here (loop_end);
@@ -27689,10 +27754,10 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
           for (int d = 0; d < dyn_n_inner_dims and dim_count < MAX_AGG_DIMS; d++) {
             cg->inner_agg_bnd_lo[dim_count] = Emit_Temp ();
             Emit ("  %%t%u = load %s, ptr %%t%u  ; dyn deep inner lo [dim %d]\n",
-               cg->inner_agg_bnd_lo[dim_count], bt, dyn_inner_trk_lo[d], d);
+               cg->inner_agg_bnd_lo[dim_count], LLVM_Rep_To_String (bt), dyn_inner_trk_lo[d], d);
             cg->inner_agg_bnd_hi[dim_count] = Emit_Temp ();
             Emit ("  %%t%u = load %s, ptr %%t%u  ; dyn deep inner hi [dim %d]\n",
-               cg->inner_agg_bnd_hi[dim_count], bt, dyn_inner_trk_hi[d], d);
+               cg->inner_agg_bnd_hi[dim_count], LLVM_Rep_To_String (bt), dyn_inner_trk_hi[d], d);
             dim_count++;
           }
         }
@@ -27900,7 +27965,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
               uint32_t clo_v = Emit_Static_Int (con_lo, ait).reg;
               uint32_t ne = Emit_Temp ();
               Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-                 ne, ait, isf, clo_v);
+                 ne, LLVM_Rep_To_String (ait), isf, clo_v);
               uint32_t ok = cg->label_id++;
               uint32_t fail = cg->label_id++;
               Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
@@ -27981,11 +28046,11 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
             //                                                                                      
             uint32_t n_pos = Emit_Static_Int ((int128_t)n_positional, ait).reg;
             uint32_t cdiff = Emit_Temp ();
-            Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cdiff, ait, chi, clo);
+            Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cdiff, LLVM_Rep_To_String (ait), chi, clo);
             uint32_t ccnt = Emit_Temp ();
-            Emit ("  %%t%u = add %s %%t%u, 1\n", ccnt, ait, cdiff);
+            Emit ("  %%t%u = add %s %%t%u, 1\n", ccnt, LLVM_Rep_To_String (ait), cdiff);
             uint32_t mismatch = Emit_Temp ();
-            Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", mismatch, ait, n_pos, ccnt);
+            Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", mismatch, LLVM_Rep_To_String (ait), n_pos, ccnt);
             uint32_t ok_lbl = cg->label_id++;
             uint32_t fail_lbl = cg->label_id++;
             Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
@@ -28006,7 +28071,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
               : Emit_Coerce_Val (Emit_Bound_Value (&idx_ty->low_bound), ait).reg;
             uint32_t ne = Emit_Temp ();
             Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-               ne, ait, isf, clo);
+               ne, LLVM_Rep_To_String (ait), isf, clo);
             uint32_t ok2 = cg->label_id++;
             uint32_t fail2 = cg->label_id++;
             Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
@@ -28026,9 +28091,9 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
           uint32_t chi = Emit_Bound_Value (&agg_type->array.indices[0].high_bound).reg;
           chi = Emit_Convert (chi, Integer_Arith_Rep (), ait).reg;
           uint32_t ne_lo = Emit_Temp ();
-          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne_lo, ait, nclo, clo);
+          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne_lo, LLVM_Rep_To_String (ait), nclo, clo);
           uint32_t ne_hi = Emit_Temp ();
-          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne_hi, ait, nchi, chi);
+          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", ne_hi, LLVM_Rep_To_String (ait), nchi, chi);
           uint32_t mismatch = Emit_Temp ();
           Emit ("  %%t%u = or i1 %%t%u, %%t%u\n", mismatch, ne_lo, ne_hi);
           uint32_t ok_lbl = cg->label_id++;
@@ -28114,14 +28179,14 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
       LLVM_Rep bt = Array_Bound_LLVM_Rep (agg_type);
       s_bnd_lo_var = Emit_Temp ();
       Emit ("  %%t%u = alloca %s  ; track named min-low\n",
-         s_bnd_lo_var, bt);
+         s_bnd_lo_var, LLVM_Rep_To_String (bt));
       uint32_t il = Emit_Static_Int (2147483647LL, bt).reg;
-      Emit ("  store %s %%t%u, ptr %%t%u\n", bt, il, s_bnd_lo_var);
+      Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (bt), il, s_bnd_lo_var);
       s_bnd_hi_var = Emit_Temp ();
       Emit ("  %%t%u = alloca %s  ; track named max-high\n",
-         s_bnd_hi_var, bt);
+         s_bnd_hi_var, LLVM_Rep_To_String (bt));
       uint32_t ih = Emit_Static_Int ((int128_t)-2147483648LL, bt).reg;
-      Emit ("  store %s %%t%u, ptr %%t%u\n", bt, ih, s_bnd_hi_var);
+      Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (bt), ih, s_bnd_hi_var);
     }
 
     // RM 4.3.2(6): For multidim aggregates, track inner sub-aggregate                              
@@ -28142,10 +28207,10 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
       for (int d = 0; d < n_inner_dims; d++) {
         inner_trk_lo[d] = Emit_Temp ();
         Emit ("  %%t%u = alloca %s  ; expected inner lo [dim %d]\n",
-           inner_trk_lo[d], bt, d);
+           inner_trk_lo[d], LLVM_Rep_To_String (bt), d);
         inner_trk_hi[d] = Emit_Temp ();
         Emit ("  %%t%u = alloca %s  ; expected inner hi [dim %d]\n",
-           inner_trk_hi[d], bt, d);
+           inner_trk_hi[d], LLVM_Rep_To_String (bt), d);
       }
       inner_trk_first = Emit_Temp ();
       Emit ("  %%t%u = alloca i1  ; first inner seen?\n",
@@ -28223,28 +28288,28 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
               // min(cur_lo, lo_v)
               uint32_t clo = Emit_Temp ();
               Emit ("  %%t%u = load %s, ptr %%t%u\n",
-                 clo, bt, s_bnd_lo_var);
+                 clo, LLVM_Rep_To_String (bt), s_bnd_lo_var);
               uint32_t lt = Emit_Temp ();
               Emit ("  %%t%u = icmp slt %s %%t%u, %%t%u\n",
-                 lt, bt, lo_v, clo);
+                 lt, LLVM_Rep_To_String (bt), lo_v, clo);
               uint32_t nlo = Emit_Temp ();
               Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u\n",
-                 nlo, lt, bt, lo_v, bt, clo);
+                 nlo, lt, LLVM_Rep_To_String (bt), lo_v, LLVM_Rep_To_String (bt), clo);
               Emit ("  store %s %%t%u, ptr %%t%u\n",
-                 bt, nlo, s_bnd_lo_var);
+                 LLVM_Rep_To_String (bt), nlo, s_bnd_lo_var);
 
               // max(cur_hi, hi_v)
               uint32_t chi = Emit_Temp ();
               Emit ("  %%t%u = load %s, ptr %%t%u\n",
-                 chi, bt, s_bnd_hi_var);
+                 chi, LLVM_Rep_To_String (bt), s_bnd_hi_var);
               uint32_t gt = Emit_Temp ();
               Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u\n",
-                 gt, bt, hi_v, chi);
+                 gt, LLVM_Rep_To_String (bt), hi_v, chi);
               uint32_t nhi = Emit_Temp ();
               Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u\n",
-                 nhi, gt, bt, hi_v, bt, chi);
+                 nhi, gt, LLVM_Rep_To_String (bt), hi_v, LLVM_Rep_To_String (bt), chi);
               Emit ("  store %s %%t%u, ptr %%t%u\n",
-                 bt, nhi, s_bnd_hi_var);
+                 LLVM_Rep_To_String (bt), nhi, s_bnd_hi_var);
             }
 
             // RM 4.3.2(3): for a non-null range, the bounds must                                   
@@ -28275,7 +28340,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
                 uint32_t null_cmp = Emit_Temp ();
                 Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u"
                      "  ; null range?\n",
-                   null_cmp, bt, lo_s, hi_s);
+                   null_cmp, LLVM_Rep_To_String (bt), lo_s, hi_s);
                 uint32_t skip_lbl = cg->label_id++;
                 uint32_t chk_lbl  = cg->label_id++;
                 Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
@@ -28405,7 +28470,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
                           : Emit_Static_Int (Static_Int_Value (qch->range.high), bt).reg;
                         uint32_t nc = Emit_Temp ();
                         Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u"
-                             "  ; inner null?\n", nc, bt, lo_v, hi_v);
+                             "  ; inner null?\n", nc, LLVM_Rep_To_String (bt), lo_v, hi_v);
                         uint32_t sk = cg->label_id++;
                         uint32_t ck = cg->label_id++;
                         Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
@@ -28569,26 +28634,26 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
               uint32_t iv = Emit_Static_Int (cv, bt).reg;
               uint32_t clo = Emit_Temp ();
               Emit ("  %%t%u = load %s, ptr %%t%u\n",
-                 clo, bt, s_bnd_lo_var);
+                 clo, LLVM_Rep_To_String (bt), s_bnd_lo_var);
               uint32_t lt = Emit_Temp ();
               Emit ("  %%t%u = icmp slt %s %%t%u, %%t%u\n",
-                 lt, bt, iv, clo);
+                 lt, LLVM_Rep_To_String (bt), iv, clo);
               uint32_t nlo = Emit_Temp ();
               Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u\n",
-                 nlo, lt, bt, iv, bt, clo);
+                 nlo, lt, LLVM_Rep_To_String (bt), iv, LLVM_Rep_To_String (bt), clo);
               Emit ("  store %s %%t%u, ptr %%t%u\n",
-                 bt, nlo, s_bnd_lo_var);
+                 LLVM_Rep_To_String (bt), nlo, s_bnd_lo_var);
               uint32_t chi = Emit_Temp ();
               Emit ("  %%t%u = load %s, ptr %%t%u\n",
-                 chi, bt, s_bnd_hi_var);
+                 chi, LLVM_Rep_To_String (bt), s_bnd_hi_var);
               uint32_t gt = Emit_Temp ();
               Emit ("  %%t%u = icmp sgt %s %%t%u, %%t%u\n",
-                 gt, bt, iv, chi);
+                 gt, LLVM_Rep_To_String (bt), iv, chi);
               uint32_t nhi = Emit_Temp ();
               Emit ("  %%t%u = select i1 %%t%u, %s %%t%u, %s %%t%u\n",
-                 nhi, gt, bt, iv, bt, chi);
+                 nhi, gt, LLVM_Rep_To_String (bt), iv, LLVM_Rep_To_String (bt), chi);
               Emit ("  store %s %%t%u, ptr %%t%u\n",
-                 bt, nhi, s_bnd_hi_var);
+                 LLVM_Rep_To_String (bt), nhi, s_bnd_hi_var);
             }
             int128_t idx = cv - low;
             if (idx >= 0 and idx < count) {
@@ -28643,10 +28708,10 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
       if (s_track_dyn) {
         cg->inner_agg_bnd_lo[0] = Emit_Temp ();
         Emit ("  %%t%u = load %s, ptr %%t%u  ; inner actual lo\n",
-           cg->inner_agg_bnd_lo[0], bt, s_bnd_lo_var);
+           cg->inner_agg_bnd_lo[0], LLVM_Rep_To_String (bt), s_bnd_lo_var);
         cg->inner_agg_bnd_hi[0] = Emit_Temp ();
         Emit ("  %%t%u = load %s, ptr %%t%u  ; inner actual hi\n",
-           cg->inner_agg_bnd_hi[0], bt, s_bnd_hi_var);
+           cg->inner_agg_bnd_hi[0], LLVM_Rep_To_String (bt), s_bnd_hi_var);
       } else {
         cg->inner_agg_bnd_lo[0] = Emit_Static_Int (low, bt).reg;
         cg->inner_agg_bnd_hi[0] = Emit_Static_Int (high, bt).reg;
@@ -28658,10 +28723,10 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
         for (int d = 0; d < n_inner_dims and dim_count < MAX_AGG_DIMS; d++) {
           cg->inner_agg_bnd_lo[dim_count] = Emit_Temp ();
           Emit ("  %%t%u = load %s, ptr %%t%u  ; deep inner lo [dim %d]\n",
-             cg->inner_agg_bnd_lo[dim_count], bt, inner_trk_lo[d], d);
+             cg->inner_agg_bnd_lo[dim_count], LLVM_Rep_To_String (bt), inner_trk_lo[d], d);
           cg->inner_agg_bnd_hi[dim_count] = Emit_Temp ();
           Emit ("  %%t%u = load %s, ptr %%t%u  ; deep inner hi [dim %d]\n",
-             cg->inner_agg_bnd_hi[dim_count], bt, inner_trk_hi[d], d);
+             cg->inner_agg_bnd_hi[dim_count], LLVM_Rep_To_String (bt), inner_trk_hi[d], d);
           dim_count++;
         }
       }
@@ -28755,7 +28820,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
             mlo[d] = agg_d1_lo_ssa;
           } else {
             mlo[d] = Emit_Temp ();
-            Emit ("  %%t%u = add %s 0, %s  ; dim%u lo\n", mlo[d], agg_bt, I128_Decimal (dlo), d);
+            Emit ("  %%t%u = add %s 0, %s  ; dim%u lo\n", mlo[d], LLVM_Rep_To_String (agg_bt), I128_Decimal (dlo), d);
           }
           if (d == 0 and agg_hi_ssa != 0) {
             mhi[d] = agg_hi_ssa;
@@ -28763,7 +28828,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
             mhi[d] = agg_d1_hi_ssa;
           } else {
             mhi[d] = Emit_Temp ();
-            Emit ("  %%t%u = add %s 0, %s  ; dim%u hi\n", mhi[d], agg_bt, I128_Decimal (dhi), d);
+            Emit ("  %%t%u = add %s 0, %s  ; dim%u hi\n", mhi[d], LLVM_Rep_To_String (agg_bt), I128_Decimal (dhi), d);
           }
         }
         return Emit_Fat_Pointer_MultiDim (base, mlo, mhi, agg_ndims, agg_bt).reg;
@@ -28778,14 +28843,14 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
         low_temp = agg_lo_ssa;
       } else {
         low_temp = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, %s  ; static agg low\n", low_temp, agg_bt, I128_Decimal (low));
+        Emit ("  %%t%u = add %s 0, %s  ; static agg low\n", low_temp, LLVM_Rep_To_String (agg_bt), I128_Decimal (low));
       }
       uint32_t high_temp;
       if (agg_hi_ssa != 0) {
         high_temp = agg_hi_ssa;
       } else {
         high_temp = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, %s  ; static agg high\n", high_temp, agg_bt, I128_Decimal (high));
+        Emit ("  %%t%u = add %s 0, %s  ; static agg high\n", high_temp, LLVM_Rep_To_String (agg_bt), I128_Decimal (high));
       }
       return Emit_Fat_Pointer_Dynamic (base, low_temp, high_temp, agg_bt).reg;
     }
@@ -29098,7 +29163,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
             uint32_t bval = 0;
             if (bound->kind == BOUND_INTEGER) {
               bval = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %lld\n", bval, bt,
+              Emit ("  %%t%u = add %s 0, %lld\n", bval, LLVM_Rep_To_String (bt),
                  (long long)bound->int_value);
             } else if (bound->kind == BOUND_EXPR and bound->expr) {
               bval = Generate_Expression (bound->expr).reg;
@@ -29111,7 +29176,7 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
             uint32_t lbl_chk = cg->label_id++;
             uint32_t lbl_end = cg->label_id++;
             Emit ("  %%t%u = icmp sle %s %%t%u, %%t%u\n",
-               cmp, bt, lo_val, hi_val);
+               cmp, LLVM_Rep_To_String (bt), lo_val, hi_val);
             Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
                cmp, lbl_chk, lbl_end);
             Emit ("L%u:\n", lbl_chk);
@@ -29236,9 +29301,9 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
         int64_t lo = init_type->array.indices[0].low_bound.int_value;
         int64_t hi = init_type->array.indices[0].high_bound.int_value;
         low_t = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, %lld\n", low_t, con_bt, (long long)lo);
+        Emit ("  %%t%u = add %s 0, %lld\n", low_t, LLVM_Rep_To_String (con_bt), (long long)lo);
         high_t = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, %lld\n", high_t, con_bt, (long long)hi);
+        Emit ("  %%t%u = add %s 0, %lld\n", high_t, LLVM_Rep_To_String (con_bt), (long long)hi);
         len_t = Emit_Temp ();
         int64_t length = hi - lo + 1;
         if (length < 0) length = 0;  // Null range (RM 3.6.1)
@@ -29251,9 +29316,9 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
       // Dynamic bounds - use 1-based defaults
       } else {
         low_t = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, 1\n", low_t, con_bt);
+        Emit ("  %%t%u = add %s 0, 1\n", low_t, LLVM_Rep_To_String (con_bt));
         high_t = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, 1\n", high_t, con_bt);
+        Emit ("  %%t%u = add %s 0, 1\n", high_t, LLVM_Rep_To_String (con_bt));
         len_t = Emit_Temp ();
         uint32_t elem_size = init_type->array.element_type ?
                    init_type->array.element_type->size : 1;
@@ -29291,7 +29356,7 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
       if (elem_size > 1) {
         uint32_t byte_len = Emit_Temp ();
         Emit ("  %%t%u = mul %s %%t%u, %u\n",
-           byte_len, new_bt, len_t, elem_size);
+           byte_len, LLVM_Rep_To_String (new_bt), len_t, elem_size);
         len_t_64 = Emit_Extend_To_I64 (byte_len, new_bt).reg;
       } else {
         len_t_64 = Emit_Extend_To_I64 (len_t, new_bt).reg;
@@ -29336,12 +29401,12 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
         if (elo and ehi) {
           uint32_t clo = Emit_Temp ();
           Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-             clo, new_bt, low_t, elo);
+             clo, LLVM_Rep_To_String (new_bt), low_t, elo);
           Emit_Check_With_Raise (clo, true,
             "alloc fat-init array lo (RM 4.8)");
           uint32_t chi = Emit_Temp ();
           Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-             chi, new_bt, high_t, ehi);
+             chi, LLVM_Rep_To_String (new_bt), high_t, ehi);
           Emit_Check_With_Raise (chi, true,
             "alloc fat-init array hi (RM 4.8)");
         }
@@ -29391,13 +29456,13 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
         total_elems = (d == 0) ? dim_len : ({
           uint32_t prod = Emit_Temp ();
           Emit ("  %%t%u = mul %s %%t%u, %%t%u\n",
-             prod, alloc_iat, total_elems, dim_len);
+             prod, LLVM_Rep_To_String (alloc_iat), total_elems, dim_len);
           prod;
         });
       }
 
       uint32_t byte_size = Emit_Temp ();
-      Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_size, alloc_iat, total_elems, elem_size);
+      Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_size, LLVM_Rep_To_String (alloc_iat), total_elems, elem_size);
       uint32_t byte_size_64 = Emit_Extend_To_I64 (byte_size, alloc_iat).reg;
       uint32_t heap_ptr = Emit_Temp ();
       Emit ("  %%t%u = call ptr @malloc (i64 %%t%u)\n", heap_ptr, byte_size_64);
@@ -29435,12 +29500,12 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
               if (elo == 0 or ehi == 0) continue;
               uint32_t clo = Emit_Temp ();
               Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-                 clo, new_bt, low_ts[d], elo);
+                 clo, LLVM_Rep_To_String (new_bt), low_ts[d], elo);
               Emit_Check_With_Raise (clo, true,
                 "alloc fat array lo bound (RM 4.8)");
               uint32_t chi = Emit_Temp ();
               Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-                 chi, new_bt, high_ts[d], ehi);
+                 chi, LLVM_Rep_To_String (new_bt), high_ts[d], ehi);
               Emit_Check_With_Raise (chi, true,
                 "alloc fat array hi bound (RM 4.8)");
             }
@@ -29472,12 +29537,12 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
           if (elo and ehi) {
             uint32_t clo = Emit_Temp ();
             Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-               clo, new_bt, low_ts[0], elo);
+               clo, LLVM_Rep_To_String (new_bt), low_ts[0], elo);
             Emit_Check_With_Raise (clo, true,
               "alloc fat array lo bound (RM 4.8)");
             uint32_t chi = Emit_Temp ();
             Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-               chi, new_bt, high_ts[0], ehi);
+               chi, LLVM_Rep_To_String (new_bt), high_ts[0], ehi);
             Emit_Check_With_Raise (chi, true,
               "alloc fat array hi bound (RM 4.8)");
           }
@@ -29603,7 +29668,7 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
           // RM 3.7.2: Check disc value against disc subtype
           if (dc->component_type and Type_Is_Scalar (dc->component_type))
             Emit_Constraint_Check (val, dc->component_type, NULL);
-          Emit ("  store %s %%t%u, ptr %%t%u\n", dt, val, dp);
+          Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (dt), val, dp);
         }
       }
 
@@ -29761,29 +29826,29 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
             ? comp_type->array.element_type->size : 4;
           LLVM_Rep bt = Array_Bound_LLVM_Rep (comp_type);
           uint32_t tsz = Emit_Temp ();
-          Emit ("  %%t%u = add %s 0, %u\n", tsz, bt, esz);
+          Emit ("  %%t%u = add %s 0, %u\n", tsz, LLVM_Rep_To_String (bt), esz);
           for (uint32_t d = 0; d < ndim; d++) {
             uint32_t lp = Emit_Temp ();
             Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-               lp, bt, bnds, d * 2);
+               lp, LLVM_Rep_To_String (bt), bnds, d * 2);
             uint32_t lo = Emit_Temp ();
-            Emit ("  %%t%u = load %s, ptr %%t%u\n", lo, bt, lp);
+            Emit ("  %%t%u = load %s, ptr %%t%u\n", lo, LLVM_Rep_To_String (bt), lp);
             uint32_t hp = Emit_Temp ();
             Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-               hp, bt, bnds, d * 2 + 1);
+               hp, LLVM_Rep_To_String (bt), bnds, d * 2 + 1);
             uint32_t hi = Emit_Temp ();
-            Emit ("  %%t%u = load %s, ptr %%t%u\n", hi, bt, hp);
+            Emit ("  %%t%u = load %s, ptr %%t%u\n", hi, LLVM_Rep_To_String (bt), hp);
             uint32_t cnt = Emit_Temp ();
-            Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cnt, bt, hi, lo);
+            Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cnt, LLVM_Rep_To_String (bt), hi, lo);
             uint32_t c1 = Emit_Temp ();
-            Emit ("  %%t%u = add %s %%t%u, 1\n", c1, bt, cnt);
+            Emit ("  %%t%u = add %s %%t%u, 1\n", c1, LLVM_Rep_To_String (bt), cnt);
             uint32_t neg = Emit_Temp ();
-            Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, bt, c1);
+            Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, LLVM_Rep_To_String (bt), c1);
             uint32_t cl = Emit_Temp ();
             Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n",
-               cl, neg, bt, bt, c1);
+               cl, neg, LLVM_Rep_To_String (bt), LLVM_Rep_To_String (bt), c1);
             uint32_t nt = Emit_Temp ();
-            Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", nt, bt, tsz, cl);
+            Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", nt, LLVM_Rep_To_String (bt), tsz, cl);
             tsz = nt;
           }
           uint32_t sz64 = tsz;
@@ -29863,7 +29928,7 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
              ndp, comp_ptr, ndc->byte_offset);
           uint32_t nval = Emit_Disc_Constraint_Value (ct, ndi, ndt).reg;
           if (nval == 0) nval = Emit_Static_Int (0, ndt).reg;
-          Emit ("  store %s %%t%u, ptr %%t%u\n", ndt, nval, ndp);
+          Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (ndt), nval, ndp);
         }
       }
       // Apply component defaults in the nested record
@@ -29885,7 +29950,7 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
           LLVM_Rep ndt = Type_To_Rep (nct);
           LLVM_Rep nvt = Expression_LLVM_Rep (ncomp->default_expr);
           nval = Emit_Convert (nval, nvt, ndt).reg;
-          Emit ("  store %s %%t%u, ptr %%t%u\n", ndt, nval, ndp);
+          Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (ndt), nval, ndp);
         }
       }
     }
@@ -29998,7 +30063,7 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
                    ndp, ep, ndc->byte_offset);
                 uint32_t nval = Emit_Disc_Constraint_Value (elem_ty, ndi, ndt).reg;
                 if (nval == 0) nval = Emit_Static_Int (0, ndt).reg;
-                Emit ("  store %s %%t%u, ptr %%t%u\n", ndt, nval, ndp);
+                Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (ndt), nval, ndp);
               }
             }
             // Apply component defaults
@@ -30019,7 +30084,7 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
                 LLVM_Rep ndt = Type_To_Rep (nct);
                 LLVM_Rep nvt = Expression_LLVM_Rep (ncomp->default_expr);
                 nval = Emit_Convert (nval, nvt, ndt).reg;
-                Emit ("  store %s %%t%u, ptr %%t%u\n", ndt, nval, ndp);
+                Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (ndt), nval, ndp);
               }
             }
           }
@@ -30070,7 +30135,7 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
       LLVM_Rep dt = Type_To_Rep (tgt_des);
       uint32_t loaded = Emit_Temp ();
       Emit ("  %%t%u = load %s, ptr %%t%u  ; load for alloc constraint check\n",
-         loaded, dt, t);
+         loaded, LLVM_Rep_To_String (dt), t);
       Emit_Constraint_Check (loaded, tgt_des, alloc_ty);
     }
 
@@ -30080,7 +30145,7 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
       LLVM_Rep dt = Type_To_Rep (alloc_ty);
       uint32_t loaded = Emit_Temp ();
       Emit ("  %%t%u = load %s, ptr %%t%u  ; load for subtype check\n",
-         loaded, dt, t);
+         loaded, LLVM_Rep_To_String (dt), t);
       Emit_Constraint_Check (loaded, alloc_ty, NULL);
     }
 
@@ -30098,14 +30163,14 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
            dp, t, dc->byte_offset);
         uint32_t actual = Emit_Temp ();
         Emit ("  %%t%u = load %s, ptr %%t%u  ; alloc disc %.*s\n",
-           actual, dt, dp, (int)dc->name.length, dc->name.data);
+           actual, LLVM_Rep_To_String (dt), dp, (int)dc->name.length, dc->name.data);
         // Get expected disc value from target type
         uint32_t expected = Emit_Disc_Constraint_Value (tgt_des, di, dt).reg;
         if (expected == 0) continue;
         // Compare and raise CE on mismatch
         uint32_t cmp = Emit_Temp ();
         Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u  ; disc check\n",
-           cmp, dt, actual, expected);
+           cmp, LLVM_Rep_To_String (dt), actual, expected);
         Emit_Check_With_Raise (cmp, true, "allocator disc constraint (RM 4.8)");
       }
     }
@@ -30126,13 +30191,13 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
            dp, t, dc->byte_offset);
         uint32_t actual = Emit_Temp ();
         Emit ("  %%t%u = load %s, ptr %%t%u  ; default disc %.*s\n",
-           actual, dt, dp, (int)dc->name.length, dc->name.data);
+           actual, LLVM_Rep_To_String (dt), dp, (int)dc->name.length, dc->name.data);
         // Get expected disc value from target access subtype
         uint32_t expected = Emit_Disc_Constraint_Value (tgt_des, di, dt).reg;
         if (expected == 0) continue;
         uint32_t cmp = Emit_Temp ();
         Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u  ; NEW T default disc check\n",
-           cmp, dt, actual, expected);
+           cmp, LLVM_Rep_To_String (dt), actual, expected);
         Emit_Check_With_Raise (cmp, true, "allocator default disc (RM 4.8)");
       }
     }
@@ -30157,10 +30222,10 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
         uint32_t ahi = Emit_Type_Bound (act_hi, abt);
         if (elo == 0 or ehi == 0 or alo == 0 or ahi == 0) continue;
         uint32_t clo = Emit_Temp ();
-        Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", clo, abt, alo, elo);
+        Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", clo, LLVM_Rep_To_String (abt), alo, elo);
         Emit_Check_With_Raise (clo, true, "allocator array lo bound (RM 4.8)");
         uint32_t chi = Emit_Temp ();
-        Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", chi, abt, ahi, ehi);
+        Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", chi, LLVM_Rep_To_String (abt), ahi, ehi);
         Emit_Check_With_Raise (chi, true, "allocator array hi bound (RM 4.8)");
       }
     }
@@ -30198,11 +30263,11 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
              dp, ptr_val, dc->byte_offset);
           uint32_t actual = Emit_Temp ();
           Emit ("  %%t%u = load %s, ptr %%t%u  ; deref disc %.*s\n",
-             actual, dt, dp, (int)dc->name.length, dc->name.data);
+             actual, LLVM_Rep_To_String (dt), dp, (int)dc->name.length, dc->name.data);
           uint32_t expected = Emit_Disc_Constraint_Value (inner_des, di, dt).reg;
           if (expected == 0) continue;
           uint32_t cmp = Emit_Temp ();
-          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", cmp, dt, actual, expected);
+          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", cmp, LLVM_Rep_To_String (dt), actual, expected);
           Emit_Check_With_Raise (cmp, true, "access-to-constrained disc (RM 4.8)");
         }
         Emit ("  br label %%L%u\n", skip_lbl);
@@ -30241,10 +30306,10 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
           uint32_t ehi = Emit_Type_Bound (&inner_des->array.indices[xi].high_bound, abt);
           if (elo == 0 or ehi == 0) continue;
           uint32_t clo = Emit_Temp ();
-          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", clo, abt, act_lo, elo);
+          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", clo, LLVM_Rep_To_String (abt), act_lo, elo);
           Emit_Check_With_Raise (clo, true, "access-to-constrained array lo (RM 4.8)");
           uint32_t chi = Emit_Temp ();
-          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", chi, abt, act_hi, ehi);
+          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", chi, LLVM_Rep_To_String (abt), act_hi, ehi);
           Emit_Check_With_Raise (chi, true, "access-to-constrained array hi (RM 4.8)");
           break;
         }
@@ -30336,11 +30401,11 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
              dp, stored_ptr, dc->byte_offset);
           uint32_t actual = Emit_Temp ();
           Emit ("  %%t%u = load %s, ptr %%t%u  ; tgt disc %.*s\n",
-             actual, dt, dp, (int)dc->name.length, dc->name.data);
+             actual, LLVM_Rep_To_String (dt), dp, (int)dc->name.length, dc->name.data);
           uint32_t expected = Emit_Disc_Constraint_Value (inner_tgt, di, dt).reg;
           if (expected == 0) continue;
           uint32_t cmp = Emit_Temp ();
-          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", cmp, dt, actual, expected);
+          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", cmp, LLVM_Rep_To_String (dt), actual, expected);
           Emit_Check_With_Raise (cmp, true, "tgt access disc (RM 4.8)");
         }
         Emit ("  br label %%L%u\n", skip);
@@ -30373,10 +30438,10 @@ LLVM_Value Generate_Allocator (Syntax_Node *node) {
           uint32_t ehi = Emit_Type_Bound (&inner_tgt->array.indices[xi].high_bound, abt);
           if (elo == 0 or ehi == 0) continue;
           uint32_t clo = Emit_Temp ();
-          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", clo, abt, act_lo, elo);
+          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", clo, LLVM_Rep_To_String (abt), act_lo, elo);
           Emit_Check_With_Raise (clo, true, "tgt access array lo (RM 4.8)");
           uint32_t chi = Emit_Temp ();
-          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", chi, abt, act_hi, ehi);
+          Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", chi, LLVM_Rep_To_String (abt), act_hi, ehi);
           Emit_Check_With_Raise (chi, true, "tgt access array hi (RM 4.8)");
           break;
         }
@@ -30566,22 +30631,22 @@ void Generate_Assignment (Syntax_Node *node) {
           uint32_t adj = Emit_Temp ();
           Emit ("  %%t%u = sub %s %%t%u, %%t%u"
              "  ; adjust for dynamic low bound\n",
-             adj, usa_t, dest_low_expr, fat_low_conv);
+             adj, LLVM_Rep_To_String (usa_t), dest_low_expr, fat_low_conv);
           uint32_t dest_ptr = Emit_Temp ();
           Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n",
-             dest_ptr, dest_base, usa_t, adj);
+             dest_ptr, dest_base, LLVM_Rep_To_String (usa_t), adj);
 
           // Generate source and copy
           Syntax_Node *src = node->assignment.value;
           uint32_t dest_high_expr = Generate_Expression (arg->range.high).reg;
           uint32_t length = Emit_Temp ();
           Emit ("  %%t%u = sub %s %%t%u, %%t%u\n",
-             length, usa_t, dest_high_expr, dest_low_expr);
+             length, LLVM_Rep_To_String (usa_t), dest_high_expr, dest_low_expr);
           uint32_t len_plus_one = Emit_Temp ();
-          Emit ("  %%t%u = add %s %%t%u, 1\n", len_plus_one, usa_t, length);
+          Emit ("  %%t%u = add %s %%t%u, 1\n", len_plus_one, LLVM_Rep_To_String (usa_t), length);
           uint32_t byte_len_nat = Emit_Temp ();
           Emit ("  %%t%u = mul %s %%t%u, %u\n",
-             byte_len_nat, usa_t, len_plus_one, elem_sz);
+             byte_len_nat, LLVM_Rep_To_String (usa_t), len_plus_one, elem_sz);
           uint32_t byte_len = Emit_Extend_To_I64 (byte_len_nat, usa_t).reg;
 
           // Get source data
@@ -30608,7 +30673,7 @@ void Generate_Assignment (Syntax_Node *node) {
         dest_base = Emit_Temp ();
         Emit ("  %%t%u = getelementptr i8, ptr ", dest_base);
         Emit_Symbol_Storage (array_sym);
-        Emit (", %s 0\n", csa_t);
+        Emit (", %s 0\n", LLVM_Rep_To_String (csa_t));
 
         // Evaluate slice bounds and compute copy length from original range.
         // Length must use raw bounds (not index-adjusted) per Ada RM 5.2.1.
@@ -30626,24 +30691,24 @@ void Generate_Assignment (Syntax_Node *node) {
           Emit_Slice_Bound_Check (dest_lo_raw, dest_hi_raw, arr_lo_c, arr_hi_c, csa_t);
         }
         uint32_t length = Emit_Temp ();
-        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", length, csa_t, dest_hi_raw, dest_lo_raw);
+        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", length, LLVM_Rep_To_String (csa_t), dest_hi_raw, dest_lo_raw);
 
         // Destination pointer: adjust low bound to array-relative index
         uint32_t dest_idx = dest_lo_raw;
         if (low_bound != 0) {
           dest_idx = Emit_Temp ();
-          Emit ("  %%t%u = sub %s %%t%u, %s\n", dest_idx, csa_t, dest_lo_raw, I128_Decimal (low_bound));
+          Emit ("  %%t%u = sub %s %%t%u, %s\n", dest_idx, LLVM_Rep_To_String (csa_t), dest_lo_raw, I128_Decimal (low_bound));
         }
         uint32_t dest_ptr = Emit_Temp ();
         Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n",
-           dest_ptr, dest_base, csa_t, dest_idx);
+           dest_ptr, dest_base, LLVM_Rep_To_String (csa_t), dest_idx);
 
         // Ada RM 5.2.1: sliding semantics - source slides to destination.
         Syntax_Node *src = node->assignment.value;
         uint32_t len_plus_one = Emit_Temp ();
-        Emit ("  %%t%u = add %s %%t%u, 1\n", len_plus_one, csa_t, length);
+        Emit ("  %%t%u = add %s %%t%u, 1\n", len_plus_one, LLVM_Rep_To_String (csa_t), length);
         uint32_t byte_len = Emit_Temp ();
-        Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_len, csa_t, len_plus_one, elem_sz);
+        Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_len, LLVM_Rep_To_String (csa_t), len_plus_one, elem_sz);
         uint32_t byte_len_64 = Emit_Extend_To_I64 (byte_len, csa_t).reg;
 
         // Determine source data pointer
@@ -30673,7 +30738,7 @@ void Generate_Assignment (Syntax_Node *node) {
               src_base = Emit_Temp ();
               Emit ("  %%t%u = getelementptr i8, ptr ", src_base);
               Emit_Symbol_Storage (src_sym);
-              Emit (", %s 0\n", csa_t);
+              Emit (", %s 0\n", LLVM_Rep_To_String (csa_t));
             }
             uint32_t src_start = Generate_Expression (src_range->range.low).reg;
             uint32_t src_end = Generate_Expression (src_range->range.high).reg;
@@ -30693,17 +30758,17 @@ void Generate_Assignment (Syntax_Node *node) {
               uint32_t src_fat_cvt = Emit_Convert (src_fat_low, ssb, csa_t).reg;
               uint32_t adj = Emit_Temp ();
               Emit ("  %%t%u = sub %s %%t%u, %%t%u\n",
-                 adj, csa_t, src_start, src_fat_cvt);
+                 adj, LLVM_Rep_To_String (csa_t), src_start, src_fat_cvt);
               src_start = adj;
             } else if (src_low_bound != 0) {
               uint32_t adj = Emit_Temp ();
               Emit ("  %%t%u = sub %s %%t%u, %s\n",
-                 adj, csa_t, src_start, I128_Decimal (src_low_bound));
+                 adj, LLVM_Rep_To_String (csa_t), src_start, I128_Decimal (src_low_bound));
               src_start = adj;
             }
             src_ptr = Emit_Temp ();
             Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n",
-               src_ptr, src_base, csa_t, src_start);
+               src_ptr, src_base, LLVM_Rep_To_String (csa_t), src_start);
 
           // Fallback: evaluate as general expression
           } else {
@@ -30727,14 +30792,14 @@ void Generate_Assignment (Syntax_Node *node) {
             src_ptr = Emit_Temp ();
             Emit ("  %%t%u = getelementptr i8, ptr ", src_ptr);
             Emit_Symbol_Storage (src->symbol);
-            Emit (", %s 0\n", csa_t);
+            Emit (", %s 0\n", LLVM_Rep_To_String (csa_t));
 
           // Expression producing a value (aggregate, call, etc.) -
           // spill to alloca, then use the alloca as source ptr
           } else {
             uint32_t spill = Emit_Temp ();
-            Emit ("  %%t%u = alloca %s\n", spill, src_llvm);
-            Emit ("  store %s %%t%u, ptr %%t%u\n", src_llvm, src_val, spill);
+            Emit ("  %%t%u = alloca %s\n", spill, LLVM_Rep_To_String (src_llvm));
+            Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (src_llvm), src_val, spill);
             src_ptr = spill;
           }
         }
@@ -30766,7 +30831,7 @@ void Generate_Assignment (Syntax_Node *node) {
         LLVM_Rep value_type = Expression_LLVM_Rep (node->assignment.value);
         value = Emit_Convert (value, value_type, elem_type_str).reg;
         Emit ("  store %s %%t%u, ptr %%t%u  ; array element assign\n",
-           elem_type_str, value, elem_ptr);
+           LLVM_Rep_To_String (elem_type_str), value, elem_ptr);
       }
       return;
     }
@@ -30785,7 +30850,7 @@ void Generate_Assignment (Syntax_Node *node) {
         LLVM_Rep value_type = Expression_LLVM_Rep (node->assignment.value);
         value = Emit_Convert (value, value_type, elem_type_str).reg;
         Emit ("  store %s %%t%u, ptr %%t%u  ; access-array element assign\n",
-           elem_type_str, value, elem_ptr);
+           LLVM_Rep_To_String (elem_type_str), value, elem_ptr);
         return;
       }
     }
@@ -30824,7 +30889,7 @@ void Generate_Assignment (Syntax_Node *node) {
       LLVM_Rep value_type = Expression_LLVM_Rep (node->assignment.value);
       value = Emit_Convert (value, value_type, dest_type).reg;
       Emit ("  store %s %%t%u, ptr %%t%u  ; .ALL assignment\n",
-         dest_type, value, ptr);
+         LLVM_Rep_To_String (dest_type), value, ptr);
       return;
     }
   }
@@ -31085,7 +31150,7 @@ void Generate_Assignment (Syntax_Node *node) {
           if (dst_length < 0) dst_length = 0;
           dst_len = Emit_Temp ();
           Emit ("  %%t%u = add %s 0, %s  ; constrained target length\n",
-             dst_len, ca_bt, I128_Decimal (dst_length));
+             dst_len, LLVM_Rep_To_String (ca_bt), I128_Decimal (dst_length));
         }
         Emit_Length_Check (src_len, dst_len, ca_bt, ty);
       }
@@ -31101,7 +31166,7 @@ void Generate_Assignment (Syntax_Node *node) {
         uint32_t bytes = slen;
         if (esz != 1) {
           bytes = Emit_Temp ();
-          Emit ("  %%t%u = mul %s %%t%u, %u\n", bytes, ca_bt, slen, esz);
+          Emit ("  %%t%u = mul %s %%t%u, %u\n", bytes, LLVM_Rep_To_String (ca_bt), slen, esz);
         }
         uint32_t bytes64 = Emit_Extend_To_I64 (bytes, ca_bt).reg;
         Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %%t%u, i1 false)  ; dyn-constrained array assign\n",
@@ -31170,7 +31235,7 @@ void Generate_Assignment (Syntax_Node *node) {
         uint32_t dim_len = Emit_Fat_Pointer_Length_Dim (existing_fat, ua_bt, d).reg;
         uint32_t prod = Emit_Temp ();
         Emit ("  %%t%u = mul %s %%t%u, %%t%u\n",
-           prod, ua_bt, dest_total_elems, dim_len);
+           prod, LLVM_Rep_To_String (ua_bt), dest_total_elems, dim_len);
         dest_total_elems = prod;
       }
     }
@@ -31588,26 +31653,26 @@ void Generate_Return_Statement (Syntax_Node *node) {
           ? Type_Bound_Value (des->array.indices[0].high_bound) : 0;
 
         uint32_t blo_p = Emit_Temp ();
-        Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i64 -2\n", blo_p, bt, data_ptr);
+        Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i64 -2\n", blo_p, LLVM_Rep_To_String (bt), data_ptr);
         uint32_t blo = Emit_Temp ();
-        Emit ("  %%t%u = load %s, ptr %%t%u\n", blo, bt, blo_p);
+        Emit ("  %%t%u = load %s, ptr %%t%u\n", blo, LLVM_Rep_To_String (bt), blo_p);
         uint32_t bhi_p = Emit_Temp ();
-        Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i64 -1\n", bhi_p, bt, data_ptr);
+        Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i64 -1\n", bhi_p, LLVM_Rep_To_String (bt), data_ptr);
         uint32_t bhi = Emit_Temp ();
-        Emit ("  %%t%u = load %s, ptr %%t%u\n", bhi, bt, bhi_p);
+        Emit ("  %%t%u = load %s, ptr %%t%u\n", bhi, LLVM_Rep_To_String (bt), bhi_p);
 
         // Compare lo and hi
         LLVM_Rep iat = Integer_Arith_Rep ();
         blo = Emit_Convert (blo, bt, iat).reg;
         bhi = Emit_Convert (bhi, bt, iat).reg;
         uint32_t elo = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, %s\n", elo, iat, I128_Decimal (exp_lo));
+        Emit ("  %%t%u = add %s 0, %s\n", elo, LLVM_Rep_To_String (iat), I128_Decimal (exp_lo));
         uint32_t ehi = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, %s\n", ehi, iat, I128_Decimal (exp_hi));
+        Emit ("  %%t%u = add %s 0, %s\n", ehi, LLVM_Rep_To_String (iat), I128_Decimal (exp_hi));
         uint32_t clo = Emit_Temp ();
-        Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", clo, iat, blo, elo);
+        Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", clo, LLVM_Rep_To_String (iat), blo, elo);
         uint32_t chi = Emit_Temp ();
-        Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", chi, iat, bhi, ehi);
+        Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n", chi, LLVM_Rep_To_String (iat), bhi, ehi);
         uint32_t bad = Emit_Temp ();
         Emit ("  %%t%u = or i1 %%t%u, %%t%u\n", bad, clo, chi);
         uint32_t raise_lbl = Emit_Label ();
@@ -32350,7 +32415,7 @@ void Generate_Statement (Syntax_Node *node) {
           LLVM_Rep eidx_t2 = Integer_Arith_Rep ();
           uint32_t entry_idx = Emit_Temp ();
           Emit ("  %%t%u = add %s 0, %u  ; entry index (simple entry)\n",
-             entry_idx, eidx_t2, entry_sym->entry_index * 1000);
+             entry_idx, LLVM_Rep_To_String (eidx_t2), entry_sym->entry_index * 1000);
 
           // Call runtime entry call function - widen entry index for RTS ABI
           uint32_t entry_idx_64 = Emit_Extend_To_I64 (entry_idx, eidx_t2).reg;
@@ -32538,21 +32603,21 @@ void Generate_Statement (Syntax_Node *node) {
                       uint32_t f_hi = Emit_Bound_Value (&fi->high_bound).reg;
                       if (f_lo and f_hi) {
                         uint32_t fl = Emit_Temp ();
-                        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", fl, iat,
+                        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", fl, LLVM_Rep_To_String (iat),
                            Emit_Convert (f_hi, iat, iat).reg,
                            Emit_Convert (f_lo, iat, iat).reg);
                         uint32_t fl1 = Emit_Temp ();
-                        Emit ("  %%t%u = add %s %%t%u, 1\n", fl1, iat, fl);
+                        Emit ("  %%t%u = add %s %%t%u, 1\n", fl1, LLVM_Rep_To_String (iat), fl);
 
                         // Clamp to 0 for null ranges (RM 3.6.1)
                         uint32_t neg = Emit_Temp ();
-                        Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, iat, fl1);
+                        Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, LLVM_Rep_To_String (iat), fl1);
                         uint32_t clamped = Emit_Temp ();
                         Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n",
-                           clamped, neg, iat, iat, fl1);
+                           clamped, neg, LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat), fl1);
                         uint32_t al = Emit_Temp ();
                         Emit ("  %%t%u = add %s 0, %u  ; agg dim %u count\n",
-                           al, iat, agg_dim_lengths[d], d);
+                           al, LLVM_Rep_To_String (iat), agg_dim_lengths[d], d);
                         Emit_Length_Check (al, clamped, iat, pt);
                       }
                     }
@@ -32574,20 +32639,20 @@ void Generate_Statement (Syntax_Node *node) {
                       Emit ("  %%t%u = getelementptr i8, ptr %%t%u, i64 %u\n",
                          dp, val, dc->byte_offset);
                       uint32_t dv = Emit_Temp ();
-                      Emit ("  %%t%u = load %s, ptr %%t%u\n", dv, dt, dp);
+                      Emit ("  %%t%u = load %s, ptr %%t%u\n", dv, LLVM_Rep_To_String (dt), dp);
 
                       // Get constraint value
                       uint32_t cv;
                       cv = Emit_Disc_Constraint_Value (pt, d, dt).reg;
                       if (cv == 0) {
                         cv = Emit_Temp ();
-                        Emit ("  %%t%u = add %s 0, 0\n", cv, dt);
+                        Emit ("  %%t%u = add %s 0, 0\n", cv, LLVM_Rep_To_String (dt));
                       }
 
                       // Compare
                       uint32_t cmp = Emit_Temp ();
                       Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-                         cmp, dt, dv, cv);
+                         cmp, LLVM_Rep_To_String (dt), dv, cv);
                       uint32_t rl = cg->label_id++;
                       uint32_t cl = cg->label_id++;
                       Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
@@ -32761,7 +32826,7 @@ void Generate_Statement (Syntax_Node *node) {
         if (delay_type and Type_Is_Fixed_Point (delay_type)) {
           LLVM_Rep fix_llvm = Type_To_Rep (delay_type);
           uint32_t dbl_val = Emit_Temp ();
-          Emit ("  %%t%u = sitofp %s %%t%u to double\n", dbl_val, fix_llvm, val);
+          Emit ("  %%t%u = sitofp %s %%t%u to double\n", dbl_val, LLVM_Rep_To_String (fix_llvm), val);
           double small = delay_type->fixed.small;
           if (small <= 0) small = delay_type->fixed.delta > 0 ? delay_type->fixed.delta : 1.0;
           uint64_t sbits; memcpy (&sbits, &small, sizeof (sbits));
@@ -32801,10 +32866,10 @@ void Generate_Statement (Syntax_Node *node) {
           LLVM_Rep idx_t = Expression_LLVM_Rep (node->accept_stmt.index);
           idx_val = Emit_Convert (idx_val, idx_t, acc_eidx_t).reg;
           Emit ("  %%t%u = add %s %u, %%t%u  ; entry index (base + family)\n",
-             entry_idx, acc_eidx_t, base_idx * 1000, idx_val);
+             entry_idx, LLVM_Rep_To_String (acc_eidx_t), base_idx * 1000, idx_val);
         } else {
           Emit ("  %%t%u = add %s 0, %u  ; entry index (simple entry)\n",
-             entry_idx, acc_eidx_t, base_idx * 1000);
+             entry_idx, LLVM_Rep_To_String (acc_eidx_t), base_idx * 1000);
         }
 
         // Wait for entry call - widen entry index for RTS ABI
@@ -32892,24 +32957,24 @@ void Generate_Statement (Syntax_Node *node) {
                       else {
                         uint32_t p2 = Emit_Temp ();
                         Emit ("  %%t%u = mul %s %%t%u, %%t%u\n",
-                           p2, iat, total, dlen);
+                           p2, LLVM_Rep_To_String (iat), total, dlen);
                         total = p2;
                       }
                     }
                     uint32_t bsz = Emit_Temp ();
                     Emit ("  %%t%u = mul %s %%t%u, %u\n",
-                       bsz, iat, total, elem_sz);
+                       bsz, LLVM_Rep_To_String (iat), total, elem_sz);
                     uint32_t neg_chk = Emit_Temp ();
                     Emit ("  %%t%u = icmp slt %s %%t%u, 0\n",
-                       neg_chk, iat, bsz);
+                       neg_chk, LLVM_Rep_To_String (iat), bsz);
                     uint32_t csz = Emit_Temp ();
                     Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n",
-                       csz, neg_chk, iat, iat, bsz);
+                       csz, neg_chk, LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat), bsz);
 
                     // 3. Alloca for local data copy, memcpy from data_ptr
                     uint32_t data_alloca = Emit_Temp ();
                     Emit ("  %%t%u = alloca i8, %s %%t%u, align 8\n",
-                       data_alloca, iat, csz);
+                       data_alloca, LLVM_Rep_To_String (iat), csz);
                     uint32_t csz64 = Emit_Extend_To_I64 (csz, iat).reg;
                     Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%t%u, ptr %%t%u, i64 %%t%u, i1 false)\n",
                        data_alloca, data_ptr, csz64);
@@ -32923,12 +32988,12 @@ void Generate_Statement (Syntax_Node *node) {
                       Emit ("  %%t%u = getelementptr i32, ptr %%t%u, i32 %u\n",
                          lo_slot, bounds_alloca, d * 2);
                       Emit ("  store %s %%t%u, ptr %%t%u\n",
-                         iat, lo_regs[d], lo_slot);
+                         LLVM_Rep_To_String (iat), lo_regs[d], lo_slot);
                       uint32_t hi_slot = Emit_Temp ();
                       Emit ("  %%t%u = getelementptr i32, ptr %%t%u, i32 %u\n",
                          hi_slot, bounds_alloca, d * 2 + 1);
                       Emit ("  store %s %%t%u, ptr %%t%u\n",
-                         iat, hi_regs[d], hi_slot);
+                         LLVM_Rep_To_String (iat), hi_regs[d], hi_slot);
                     }
 
                     // 5. Create fat pointer variable { data_ptr, bounds_ptr }
@@ -33048,10 +33113,10 @@ void Generate_Statement (Syntax_Node *node) {
                   LLVM_Rep idx_t = Expression_LLVM_Rep (alt->accept_stmt.index);
                   idx_val = Emit_Convert (idx_val, idx_t, sel_eidx_t).reg;
                   Emit ("  %%t%u = add %s %u, %%t%u  ; entry index (base + family)\n",
-                     entry_idx, sel_eidx_t, sel_base_idx * 1000, idx_val);
+                     entry_idx, LLVM_Rep_To_String (sel_eidx_t), sel_base_idx * 1000, idx_val);
                 } else {
                   Emit ("  %%t%u = add %s 0, %u  ; entry index (simple entry)\n",
-                     entry_idx, sel_eidx_t, sel_base_idx * 1000);
+                     entry_idx, LLVM_Rep_To_String (sel_eidx_t), sel_base_idx * 1000);
                 }
 
                 // Check if entry call is pending - widen for RTS ABI
@@ -33123,7 +33188,7 @@ void Generate_Statement (Syntax_Node *node) {
                   if (dur_type and Type_Is_Fixed_Point (dur_type)) {
                     LLVM_Rep fix_llvm = Type_To_Rep (dur_type);
                     uint32_t dbl_val = Emit_Temp ();
-                    Emit ("  %%t%u = sitofp %s %%t%u to double\n", dbl_val, fix_llvm, dur);
+                    Emit ("  %%t%u = sitofp %s %%t%u to double\n", dbl_val, LLVM_Rep_To_String (fix_llvm), dur);
                     double sm = dur_type->fixed.small;
                     if (sm <= 0) sm = dur_type->fixed.delta > 0 ? dur_type->fixed.delta : 1.0;
                     uint64_t sb; memcpy (&sb, &sm, sizeof (sb));
@@ -33490,7 +33555,7 @@ void Emit_Nested_Disc_Checks (Type_Info *parent_type)
         // Pre-evaluated non-disc expression: load and check
         val = Emit_Temp ();
         Emit ("  %%t%u = load %s, ptr %%t%u  ; nested disc check\n",
-           val, dt, ct->record.disc_constraint_preeval[di]);
+           val, LLVM_Rep_To_String (dt), ct->record.disc_constraint_preeval[di]);
       } else if (ct->record.disc_constraint_exprs and
              ct->record.disc_constraint_exprs[di]) {
 
@@ -33513,7 +33578,7 @@ void Emit_Nested_Disc_Checks (Type_Info *parent_type)
         }
       } else if (ct->record.disc_constraint_values) {
         val = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, %lld\n", val, dt,
+        Emit ("  %%t%u = add %s 0, %lld\n", val, LLVM_Rep_To_String (dt),
            (long long)ct->record.disc_constraint_values[di]);
       }
       if (val > 0)
@@ -33551,17 +33616,17 @@ void Emit_Nested_Disc_Checks (Type_Info *parent_type)
       Variant_Info *vinfo = &parent_type->record.variants[comp_vi2];
       if (not vinfo->is_others) {
         uint32_t lo = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, %lld\n", lo, runtime_disc_type,
+        Emit ("  %%t%u = add %s 0, %lld\n", lo, LLVM_Rep_To_String (runtime_disc_type),
            (long long)vinfo->disc_value_low);
         uint32_t hi = Emit_Temp ();
-        Emit ("  %%t%u = add %s 0, %lld\n", hi, runtime_disc_type,
+        Emit ("  %%t%u = add %s 0, %lld\n", hi, LLVM_Rep_To_String (runtime_disc_type),
            (long long)vinfo->disc_value_high);
         uint32_t cmp_lo = Emit_Temp ();
         Emit ("  %%t%u = icmp sge %s %%t%u, %%t%u\n",
-           cmp_lo, runtime_disc_type, runtime_disc_val, lo);
+           cmp_lo, LLVM_Rep_To_String (runtime_disc_type), runtime_disc_val, lo);
         uint32_t cmp_hi = Emit_Temp ();
         Emit ("  %%t%u = icmp sle %s %%t%u, %%t%u\n",
-           cmp_hi, runtime_disc_type, runtime_disc_val, hi);
+           cmp_hi, LLVM_Rep_To_String (runtime_disc_type), runtime_disc_val, hi);
         uint32_t in_range = Emit_Temp ();
         Emit ("  %%t%u = and i1 %%t%u, %%t%u\n",
            in_range, cmp_lo, cmp_hi);
@@ -33597,7 +33662,7 @@ void Emit_Nested_Disc_Checks (Type_Info *parent_type)
         uint32_t bval = 0;
         if (bound->kind == BOUND_INTEGER) {
           bval = Emit_Temp ();
-          Emit ("  %%t%u = add %s 0, %lld\n", bval, bt,
+          Emit ("  %%t%u = add %s 0, %lld\n", bval, LLVM_Rep_To_String (bt),
              (long long)bound->int_value);
         } else if (bound->kind == BOUND_EXPR and bound->expr) {
           Syntax_Node *bexpr = bound->expr;
@@ -33629,7 +33694,7 @@ void Emit_Nested_Disc_Checks (Type_Info *parent_type)
         uint32_t lbl_chk = cg->label_id++;
         uint32_t lbl_end = cg->label_id++;
         Emit ("  %%t%u = icmp sle %s %%t%u, %%t%u\n",
-           cmp, bt, lo_val, hi_val);
+           cmp, LLVM_Rep_To_String (bt), lo_val, hi_val);
         Emit ("  br i1 %%t%u, label %%L%u, label %%L%u\n",
            cmp, lbl_chk, lbl_end);
         Emit ("L%u:\n", lbl_chk);
@@ -34105,14 +34170,14 @@ void Generate_Object_Declaration (Syntax_Node *node) {
             uint32_t total_len = 0;
             for (uint32_t d = 0; d < ndims; d++) {
               uint32_t diff_d = Emit_Temp ();
-              Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", diff_d, bt, dim_hi[d], dim_lo[d]);
+              Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", diff_d, LLVM_Rep_To_String (bt), dim_hi[d], dim_lo[d]);
               uint32_t len_d = Emit_Temp ();
-              Emit ("  %%t%u = add %s %%t%u, 1\n", len_d, bt, diff_d);
+              Emit ("  %%t%u = add %s %%t%u, 1\n", len_d, LLVM_Rep_To_String (bt), diff_d);
               if (d == 0) {
                 total_len = len_d;
               } else {
                 uint32_t prod = Emit_Temp ();
-                Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", prod, bt, total_len, len_d);
+                Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", prod, LLVM_Rep_To_String (bt), total_len, len_d);
                 total_len = prod;
               }
             }
@@ -34122,7 +34187,7 @@ void Generate_Object_Declaration (Syntax_Node *node) {
             if (elem_sz == 0) elem_sz = 4;
             uint32_t byte_len = Emit_Temp ();
             Emit ("  %%t%u = mul %s %%t%u, %u  ; total bytes\n",
-               byte_len, bt, total_len, elem_sz);
+               byte_len, LLVM_Rep_To_String (bt), total_len, elem_sz);
             uint32_t byte_len64 = Emit_Extend_To_I64 (byte_len, bt).reg;
 
             // Allocate data storage
@@ -34506,7 +34571,7 @@ obj_decl_init:
                 val = Emit_Disc_Constraint_Value (ty, di, dt).reg;
                 if (val == 0) val = Emit_Static_Int (0, dt).reg;
               }
-              Emit ("  store %s %%t%u, ptr %%t%u  ; disc store\n", dt, val, dp);
+              Emit ("  store %s %%t%u, ptr %%t%u  ; disc store\n", LLVM_Rep_To_String (dt), val, dp);
             }
           }
           sym->is_disc_constrained = true;
@@ -34550,10 +34615,10 @@ obj_decl_init:
               Type_Bound lo_b = agg_type->array.indices[d].low_bound;
               Type_Bound hi_b = agg_type->array.indices[d].high_bound;
               agg_mlo[d] = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %s\n", agg_mlo[d], iat_agg,
+              Emit ("  %%t%u = add %s 0, %s\n", agg_mlo[d], LLVM_Rep_To_String (iat_agg),
                  lo_b.kind == BOUND_INTEGER ? I128_Decimal (lo_b.int_value) : "1");
               agg_mhi[d] = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %s\n", agg_mhi[d], iat_agg,
+              Emit ("  %%t%u = add %s 0, %s\n", agg_mhi[d], LLVM_Rep_To_String (iat_agg),
                  hi_b.kind == BOUND_INTEGER ? I128_Decimal (hi_b.int_value) : "0");
             }
             uint32_t fat = Emit_Fat_Pointer_MultiDim (agg_ptr, agg_mlo, agg_mhi, agg_ndims, agg_abt).reg;
@@ -34564,17 +34629,17 @@ obj_decl_init:
             uint32_t low_val, high_val;
             if (low_b.kind == BOUND_INTEGER) {
               low_val = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %s\n", low_val, iat_agg, I128_Decimal (low_b.int_value));
+              Emit ("  %%t%u = add %s 0, %s\n", low_val, LLVM_Rep_To_String (iat_agg), I128_Decimal (low_b.int_value));
             } else {
               low_val = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, 1\n", low_val, iat_agg);
+              Emit ("  %%t%u = add %s 0, 1\n", low_val, LLVM_Rep_To_String (iat_agg));
             }
             if (high_b.kind == BOUND_INTEGER) {
               high_val = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %s\n", high_val, iat_agg, I128_Decimal (high_b.int_value));
+              Emit ("  %%t%u = add %s 0, %s\n", high_val, LLVM_Rep_To_String (iat_agg), I128_Decimal (high_b.int_value));
             } else {
               high_val = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, 0\n", high_val, iat_agg);
+              Emit ("  %%t%u = add %s 0, 0\n", high_val, LLVM_Rep_To_String (iat_agg));
             }
             Emit_Store_Fat_Pointer_Fields_To_Symbol (agg_ptr, low_val, high_val, sym, agg_abt);
           }
@@ -34650,10 +34715,10 @@ obj_decl_init:
           uint32_t byte_len = Emit_Temp ();
           if (e_sz == 1) {
             Emit ("  %%t%u = add %s %%t%u, 0  ; byte_len\n",
-               byte_len, uai_iat, len_cvt);
+               byte_len, LLVM_Rep_To_String (uai_iat), len_cvt);
           } else {
             Emit ("  %%t%u = mul %s %%t%u, %u  ; byte_len\n",
-               byte_len, uai_iat, len_cvt, e_sz);
+               byte_len, LLVM_Rep_To_String (uai_iat), len_cvt, e_sz);
           }
 
           // Widen byte_len to i64 for alloca and memcpy intrinsics
@@ -34722,7 +34787,7 @@ obj_decl_init:
                sdp, init_ptr, dc->byte_offset);
             uint32_t sv = Emit_Temp ();
             Emit ("  %%t%u = load %s, ptr %%t%u  ; init disc %.*s\n",
-               sv, dt, sdp, (int)dc->name.length, dc->name.data);
+               sv, LLVM_Rep_To_String (dt), sdp, (int)dc->name.length, dc->name.data);
             uint32_t cv;
             if (di < rec_disc_count and rec_disc_cached[di].reg) {
               cv = Emit_Coerce_Val (rec_disc_cached[di], dt).reg;
@@ -34904,7 +34969,7 @@ obj_decl_init:
                  dp, init_ptr, dc->byte_offset);
               uint32_t dv = Emit_Temp ();
               Emit ("  %%t%u = load %s, ptr %%t%u  ; access disc %.*s\n",
-                 dv, dt, dp, (int)dc->name.length, dc->name.data);
+                 dv, LLVM_Rep_To_String (dt), dp, (int)dc->name.length, dc->name.data);
               uint32_t cv;
 
               // Use pre-cached disc values if available
@@ -34945,13 +35010,13 @@ obj_decl_init:
                 // Check lo match
                 uint32_t clo = Emit_Temp ();
                 Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-                   clo, abt, act_lo, exp_lo);
+                   clo, LLVM_Rep_To_String (abt), act_lo, exp_lo);
                 Emit_Check_With_Raise (clo, true, "access array lo bound");
 
                 // Check hi match
                 uint32_t chi = Emit_Temp ();
                 Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-                   chi, abt, act_hi, exp_hi);
+                   chi, LLVM_Rep_To_String (abt), act_hi, exp_hi);
                 Emit_Check_With_Raise (chi, true, "access array hi bound");
               }
             } else if (node->object_decl.init and
@@ -35006,13 +35071,13 @@ obj_decl_init:
                   // Check lo match
                   uint32_t clo = Emit_Temp ();
                   Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-                     clo, abt, act_lo, exp_lo);
+                     clo, LLVM_Rep_To_String (abt), act_lo, exp_lo);
                   Emit_Check_With_Raise (clo, true, "access array lo bound");
 
                   // Check hi match
                   uint32_t chi = Emit_Temp ();
                   Emit ("  %%t%u = icmp ne %s %%t%u, %%t%u\n",
-                     chi, abt, act_hi, exp_hi);
+                     chi, LLVM_Rep_To_String (abt), act_hi, exp_hi);
                   Emit_Check_With_Raise (chi, true, "access array hi bound");
                 }
                 Emit ("  br label %%L%u\n", lbl_aend);
@@ -35071,8 +35136,8 @@ obj_decl_init:
             dhi[d] = dlo[d];
           } else {
             dlo[d] = Emit_Temp (); dhi[d] = Emit_Temp ();
-            Emit ("  %%t%u = add %s 0, 1\n", dlo[d], iat);
-            Emit ("  %%t%u = add %s 0, 0\n", dhi[d], iat);
+            Emit ("  %%t%u = add %s 0, 1\n", dlo[d], LLVM_Rep_To_String (iat));
+            Emit ("  %%t%u = add %s 0, 0\n", dhi[d], LLVM_Rep_To_String (iat));
           }
         }
         uint32_t esz = elem_size > 0 ? elem_size
@@ -35081,25 +35146,25 @@ obj_decl_init:
         uint32_t total = 0;
         for (uint32_t d = 0; d < ndims; d++) {
           uint32_t cnt = Emit_Temp ();
-          Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cnt, iat, dhi[d], dlo[d]);
+          Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cnt, LLVM_Rep_To_String (iat), dhi[d], dlo[d]);
           uint32_t len = Emit_Temp ();
-          Emit ("  %%t%u = add %s %%t%u, 1\n", len, iat, cnt);
+          Emit ("  %%t%u = add %s %%t%u, 1\n", len, LLVM_Rep_To_String (iat), cnt);
           if (d == 0) total = len;
           else {
             uint32_t p = Emit_Temp ();
-            Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", p, iat, total, len);
+            Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", p, LLVM_Rep_To_String (iat), total, len);
             total = p;
           }
         }
         uint32_t bsz_raw = Emit_Temp ();
-        Emit ("  %%t%u = mul %s %%t%u, %u\n", bsz_raw, iat, total, esz);
+        Emit ("  %%t%u = mul %s %%t%u, %u\n", bsz_raw, LLVM_Rep_To_String (iat), total, esz);
         uint32_t neg = Emit_Temp ();
-        Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, iat, bsz_raw);
+        Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, LLVM_Rep_To_String (iat), bsz_raw);
         uint32_t bsz = Emit_Temp ();
         Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n",
-           bsz, neg, iat, iat, bsz_raw);
+           bsz, neg, LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat), bsz_raw);
         uint32_t dp = Emit_Temp ();
-        Emit ("  %%t%u = alloca i8, %s %%t%u  ; generic formal array\n", dp, iat, bsz);
+        Emit ("  %%t%u = alloca i8, %s %%t%u  ; generic formal array\n", dp, LLVM_Rep_To_String (iat), bsz);
         if (ndims > 1) {
           uint32_t fat = Emit_Fat_Pointer_MultiDim (dp, dlo, dhi, ndims, iat).reg;
           Emit_Store_Fat_Pointer_To_Symbol (fat, sym, iat);
@@ -35124,7 +35189,7 @@ obj_decl_init:
         // Get low bound
         if (low_b.kind == BOUND_INTEGER) {
           dim_lo_decl[d] = Emit_Temp ();
-          Emit ("  %%t%u = add %s 0, %s\n", dim_lo_decl[d], iat_decl, I128_Decimal (low_b.int_value));
+          Emit ("  %%t%u = add %s 0, %s\n", dim_lo_decl[d], LLVM_Rep_To_String (iat_decl), I128_Decimal (low_b.int_value));
 
         // RM 3.3.1: Reuse cached temp from subtype elaboration
         // to avoid re-evaluating side-effectful expressions.
@@ -35200,26 +35265,26 @@ obj_decl_init:
       uint32_t total_count = 0;
       for (uint32_t d = 0; d < ndims_decl; d++) {
         uint32_t count_d = Emit_Temp ();
-        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", count_d, iat_decl, dim_hi_decl[d], dim_lo_decl[d]);
+        Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", count_d, LLVM_Rep_To_String (iat_decl), dim_hi_decl[d], dim_lo_decl[d]);
         uint32_t len_d = Emit_Temp ();
-        Emit ("  %%t%u = add %s %%t%u, 1\n", len_d, iat_decl, count_d);
+        Emit ("  %%t%u = add %s %%t%u, 1\n", len_d, LLVM_Rep_To_String (iat_decl), count_d);
         if (d == 0) {
           total_count = len_d;
         } else {
           uint32_t prod = Emit_Temp ();
-          Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", prod, iat_decl, total_count, len_d);
+          Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", prod, LLVM_Rep_To_String (iat_decl), total_count, len_d);
           total_count = prod;
         }
       }
       uint32_t byte_size_raw = Emit_Temp ();
-      Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_size_raw, iat_decl, total_count, elem_sz);
+      Emit ("  %%t%u = mul %s %%t%u, %u\n", byte_size_raw, LLVM_Rep_To_String (iat_decl), total_count, elem_sz);
 
       // Clamp to 0 for null ranges: hi < lo → negative count → huge unsigned alloca
       uint32_t neg_chk = Emit_Temp ();
-      Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg_chk, iat_decl, byte_size_raw);
+      Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg_chk, LLVM_Rep_To_String (iat_decl), byte_size_raw);
       uint32_t byte_size = Emit_Temp ();
       Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n",
-         byte_size, neg_chk, iat_decl, iat_decl, byte_size_raw);
+         byte_size, neg_chk, LLVM_Rep_To_String (iat_decl), LLVM_Rep_To_String (iat_decl), byte_size_raw);
       uint32_t data_ptr = Emit_Temp ();
       Emit ("  %%t%u = alloca i8, %s %%t%u  ; dynamic uninit array\n", data_ptr, LLVM_Rep_To_String (iat_decl), byte_size);
 
@@ -35255,7 +35320,7 @@ obj_decl_init:
           // Use pre-evaluated / runtime / static constraint value
           val = Emit_Disc_Constraint_Value (ty, di, dt).reg;
           if (val == 0) val = Emit_Static_Int (0, dt).reg;
-          Emit ("  store %s %%t%u, ptr %%t%u  ; disc init\n", dt, val, dp);
+          Emit ("  store %s %%t%u, ptr %%t%u  ; disc init\n", LLVM_Rep_To_String (dt), val, dp);
 
           // RM 3.7.2: Check discriminant value against disc subtype
           if (dc->component_type and Type_Is_Scalar (dc->component_type))
@@ -35279,8 +35344,8 @@ obj_decl_init:
                   Symbol *dsym = bds[bi2]->expr->symbol;
                   if (dsym->disc_agg_temp == 0) {
                     uint32_t dt2 = Emit_Temp ();
-                    Emit ("  %%t%u = alloca %s  ; decl disc temp\n", dt2, dt);
-                    Emit ("  store %s %%t%u, ptr %%t%u\n", dt, val, dt2);
+                    Emit ("  %%t%u = alloca %s  ; decl disc temp\n", dt2, LLVM_Rep_To_String (dt));
+                    Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (dt), val, dt2);
                     dsym->disc_agg_temp = dt2;
                     if (disc_temp_count < 16) disc_temps[disc_temp_count++] = dsym;
                   }
@@ -35311,7 +35376,7 @@ obj_decl_init:
           if (expr and expr->kind == NK_ASSOCIATION)
             expr = expr->association.expression;
           uint32_t val = Emit_Coerce_Val (Generate_Expression (expr), dt).reg;
-          Emit ("  store %s %%t%u, ptr %%t%u  ; disc from decl constraint\n", dt, val, dp);
+          Emit ("  store %s %%t%u, ptr %%t%u  ; disc from decl constraint\n", LLVM_Rep_To_String (dt), val, dp);
         }
         sym->is_disc_constrained = true;
       }
@@ -35384,7 +35449,7 @@ obj_decl_init:
           Emit_Symbol_Name (sym);
           Emit (", i64 %u  ; %.*s pre-default\n", dc->byte_offset,
              (int)dc->name.length, dc->name.data);
-          Emit ("  store %s %%t%u, ptr %%t%u\n", dt, val, dp);
+          Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (dt), val, dp);
           if (dc->component_type and Type_Is_Scalar (dc->component_type))
             Emit_Constraint_Check (val, dc->component_type, NULL);
         }
@@ -35482,7 +35547,7 @@ obj_decl_init:
                   Emit_Symbol_Name (sym);
                   Emit (", i64 %u\n", pdc->byte_offset);
                   uint32_t ld = Emit_Temp ();
-                  Emit ("  %%t%u = load %s, ptr %%t%u\n", ld, dt, disc_val);
+                  Emit ("  %%t%u = load %s, ptr %%t%u\n", ld, LLVM_Rep_To_String (dt), disc_val);
                   disc_val = ld;
                   found_parent_disc = true;
                   break;
@@ -35499,19 +35564,19 @@ obj_decl_init:
                 ct->record.disc_constraint_preeval[di]) {
                 disc_val = Emit_Temp ();
                 Emit ("  %%t%u = load %s, ptr %%t%u  ; preeval disc\n",
-                   disc_val, dt, ct->record.disc_constraint_preeval[di]);
+                   disc_val, LLVM_Rep_To_String (dt), ct->record.disc_constraint_preeval[di]);
               } else {
                 disc_val = Emit_Coerce_Val (Generate_Expression (cexpr), dt).reg;
               }
             }
           } else if (ct->record.disc_constraint_values) {
             disc_val = Emit_Temp ();
-            Emit ("  %%t%u = add %s 0, %lld\n", disc_val, dt,
+            Emit ("  %%t%u = add %s 0, %lld\n", disc_val, LLVM_Rep_To_String (dt),
                (long long)ct->record.disc_constraint_values[di]);
           }
           if (disc_val > 0) {
             Emit ("  store %s %%t%u, ptr %%t%u  ; subcomp disc init\n",
-               dt, disc_val, dp);
+               LLVM_Rep_To_String (dt), disc_val, dp);
 
             // RM 3.7.2: Check nested disc value against disc subtype
             if (dc->component_type and Type_Is_Scalar (dc->component_type))
@@ -35645,29 +35710,29 @@ obj_decl_init:
                 ? comp_type->array.element_type->size : 4;
               LLVM_Rep bt = Array_Bound_LLVM_Rep (comp_type);
               uint32_t tsz = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %u\n", tsz, bt, esz);
+              Emit ("  %%t%u = add %s 0, %u\n", tsz, LLVM_Rep_To_String (bt), esz);
               for (uint32_t d = 0; d < ndim; d++) {
                 uint32_t lp = Emit_Temp ();
                 Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-                   lp, bt, bnds, d * 2);
+                   lp, LLVM_Rep_To_String (bt), bnds, d * 2);
                 uint32_t lo = Emit_Temp ();
-                Emit ("  %%t%u = load %s, ptr %%t%u\n", lo, bt, lp);
+                Emit ("  %%t%u = load %s, ptr %%t%u\n", lo, LLVM_Rep_To_String (bt), lp);
                 uint32_t hp = Emit_Temp ();
                 Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-                   hp, bt, bnds, d * 2 + 1);
+                   hp, LLVM_Rep_To_String (bt), bnds, d * 2 + 1);
                 uint32_t hi = Emit_Temp ();
-                Emit ("  %%t%u = load %s, ptr %%t%u\n", hi, bt, hp);
+                Emit ("  %%t%u = load %s, ptr %%t%u\n", hi, LLVM_Rep_To_String (bt), hp);
                 uint32_t cnt = Emit_Temp ();
-                Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cnt, bt, hi, lo);
+                Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cnt, LLVM_Rep_To_String (bt), hi, lo);
                 uint32_t c1 = Emit_Temp ();
-                Emit ("  %%t%u = add %s %%t%u, 1\n", c1, bt, cnt);
+                Emit ("  %%t%u = add %s %%t%u, 1\n", c1, LLVM_Rep_To_String (bt), cnt);
                 uint32_t neg = Emit_Temp ();
-                Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, bt, c1);
+                Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, LLVM_Rep_To_String (bt), c1);
                 uint32_t cl = Emit_Temp ();
                 Emit ("  %%t%u = select i1 %%t%u, %s 0, %s %%t%u\n",
-                   cl, neg, bt, bt, c1);
+                   cl, neg, LLVM_Rep_To_String (bt), LLVM_Rep_To_String (bt), c1);
                 uint32_t nt = Emit_Temp ();
-                Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", nt, bt, tsz, cl);
+                Emit ("  %%t%u = mul %s %%t%u, %%t%u\n", nt, LLVM_Rep_To_String (bt), tsz, cl);
                 tsz = nt;
               }
               uint32_t sz64 = tsz;
@@ -35826,7 +35891,7 @@ obj_decl_init:
                     Emit (", i64 %u\n", pdc->byte_offset);
                     val = Emit_Temp ();
                     Emit ("  %%t%u = load %s, ptr %%t%u  ; disc %.*s from parent\n",
-                       val, dt, gp,
+                       val, LLVM_Rep_To_String (dt), gp,
                        (int)pdc->name.length, pdc->name.data);
                     resolved = true;
                     break;
@@ -35852,7 +35917,7 @@ obj_decl_init:
              abs_off,
              (int)comp->name.length, comp->name.data,
              (int)dc->name.length, dc->name.data);
-          Emit ("  store %s %%t%u, ptr %%t%u\n", dt, val, dp);
+          Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (dt), val, dp);
 
           // Set disc_agg_temp for matching symbols found in defaults
           for (uint32_t ds = 0; ds < disc_sym_count; ds++) {
@@ -35860,8 +35925,8 @@ obj_decl_init:
             if (dsym->disc_agg_temp != 0) continue;
             if (not Slice_Equal_Ignore_Case (dsym->name, dc->name)) continue;
             uint32_t dt3 = Emit_Temp ();
-            Emit ("  %%t%u = alloca %s  ; nested disc_agg_temp\n", dt3, dt);
-            Emit ("  store %s %%t%u, ptr %%t%u\n", dt, val, dt3);
+            Emit ("  %%t%u = alloca %s  ; nested disc_agg_temp\n", dt3, LLVM_Rep_To_String (dt));
+            Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (dt), val, dt3);
             dsym->disc_agg_temp = dt3;
             if (nested_disc_count < 16)
               nested_disc_temps[nested_disc_count++] = dsym;
@@ -35940,22 +36005,22 @@ obj_decl_init:
                 ? sc_type->array.element_type->size : 4;
               LLVM_Rep bt = Array_Bound_LLVM_Rep (sc_type);
               uint32_t tsz = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %u\n", tsz, bt, esz);
+              Emit ("  %%t%u = add %s 0, %u\n", tsz, LLVM_Rep_To_String (bt), esz);
               for (uint32_t d = 0; d < ndim; d++) {
                 uint32_t lp = Emit_Temp ();
                 Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-                   lp, bt, bnds, d * 2);
+                   lp, LLVM_Rep_To_String (bt), bnds, d * 2);
                 uint32_t lo = Emit_Temp ();
-                Emit ("  %%t%u = load %s, ptr %%t%u\n", lo, bt, lp);
+                Emit ("  %%t%u = load %s, ptr %%t%u\n", lo, LLVM_Rep_To_String (bt), lp);
                 uint32_t hp = Emit_Temp ();
                 Emit ("  %%t%u = getelementptr %s, ptr %%t%u, i32 %u\n",
-                   hp, bt, bnds, d * 2 + 1);
+                   hp, LLVM_Rep_To_String (bt), bnds, d * 2 + 1);
                 uint32_t hi = Emit_Temp ();
-                Emit ("  %%t%u = load %s, ptr %%t%u\n", hi, bt, hp);
+                Emit ("  %%t%u = load %s, ptr %%t%u\n", hi, LLVM_Rep_To_String (bt), hp);
                 uint32_t cnt = Emit_Temp ();
-                Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cnt, bt, hi, lo);
+                Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", cnt, LLVM_Rep_To_String (bt), hi, lo);
                 uint32_t c1 = Emit_Temp ();
-                Emit ("  %%t%u = add %s %%t%u, 1\n", c1, bt, cnt);
+                Emit ("  %%t%u = add %s %%t%u, 1\n", c1, LLVM_Rep_To_String (bt), cnt);
                 uint32_t neg = Emit_Temp ();
                 Emit ("  %%t%u = icmp slt %s %%t%u, 0\n", neg, LLVM_Rep_To_String (bt), c1);
                 uint32_t cl = Emit_Temp ();
@@ -36261,7 +36326,7 @@ obj_decl_init:
                   Emit (", i64 %u\n", nest_off + npdc->byte_offset);
                   uint32_t ndv2 = Emit_Temp ();
                   Emit ("  %%t%u = load %s, ptr %%t%u  ; nested disc %.*s sub\n",
-                     ndv2, ndt2, ndp2, (int)npdc->name.length, npdc->name.data);
+                     ndv2, LLVM_Rep_To_String (ndt2), ndp2, (int)npdc->name.length, npdc->name.data);
                   Component_Info *nsub = &nct->record.components[nsdi];
                   if (nsub->component_type and Type_Is_Scalar (nsub->component_type))
                     Emit_Constraint_Check (ndv2, nsub->component_type,
@@ -36293,7 +36358,7 @@ obj_decl_init:
               Emit (", i64 %u\n", pdc->byte_offset);
               uint32_t dv = Emit_Temp ();
               Emit ("  %%t%u = load %s, ptr %%t%u  ; disc %.*s for subcomp check\n",
-                 dv, dt, dp, (int)pdc->name.length, pdc->name.data);
+                 dv, LLVM_Rep_To_String (dt), dp, (int)pdc->name.length, pdc->name.data);
               Component_Info *sub_dc = &ct->record.components[sdi];
               if (sub_dc->component_type and Type_Is_Scalar (sub_dc->component_type))
                 Emit_Constraint_Check (dv, sub_dc->component_type,
@@ -37823,7 +37888,7 @@ void Generate_Declaration (Syntax_Node *node) {
                   if (not target) continue;
                   uint32_t val = Generate_Expression (actual_expr).reg;
                   LLVM_Rep ts = Type_To_Rep (target->type);
-                  Emit ("  store %s %%t%u, ptr @", ts, val);
+                  Emit ("  store %s %%t%u, ptr @", LLVM_Rep_To_String (ts), val);
                   Emit_Symbol_Name (target);
                   Emit ("\n");
                 }
@@ -38272,8 +38337,8 @@ void Generate_Declaration (Syntax_Node *node) {
                   Generate_Expression (dct->record.disc_constraint_exprs[di]), dt).reg;
                 uint32_t alloca_t = Emit_Temp ();
                 Emit ("  %%t%u = alloca %s  ; preeval disc constraint\n",
-                   alloca_t, dt);
-                Emit ("  store %s %%t%u, ptr %%t%u\n", dt, val, alloca_t);
+                   alloca_t, LLVM_Rep_To_String (dt));
+                Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (dt), val, alloca_t);
                 dct->record.disc_constraint_preeval[di] = alloca_t;
               }
             }
@@ -38291,7 +38356,7 @@ void Generate_Declaration (Syntax_Node *node) {
                 Generate_Expression (dct->record.disc_constraint_exprs[di]), dt).reg;
             } else if (dct->record.disc_constraint_values) {
               val = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %lld\n", val, dt,
+              Emit ("  %%t%u = add %s 0, %lld\n", val, LLVM_Rep_To_String (dt),
                  (long long)dct->record.disc_constraint_values[di]);
             }
             if (val > 0)
@@ -38413,8 +38478,8 @@ void Generate_Declaration (Syntax_Node *node) {
                 Generate_Expression (sub_type->record.disc_constraint_exprs[di]), dt).reg;
               uint32_t alloca_t = Emit_Temp ();
               Emit ("  %%t%u = alloca %s  ; preeval subtype disc\n",
-                 alloca_t, dt);
-              Emit ("  store %s %%t%u, ptr %%t%u\n", dt, val, alloca_t);
+                 alloca_t, LLVM_Rep_To_String (dt));
+              Emit ("  store %s %%t%u, ptr %%t%u\n", LLVM_Rep_To_String (dt), val, alloca_t);
               sub_type->record.disc_constraint_preeval[di] = alloca_t;
             }
           }
@@ -38432,7 +38497,7 @@ void Generate_Declaration (Syntax_Node *node) {
                 Generate_Expression (sub_type->record.disc_constraint_exprs[di]), dt).reg;
             } else if (sub_type->record.disc_constraint_values) {
               val = Emit_Temp ();
-              Emit ("  %%t%u = add %s 0, %lld\n", val, dt,
+              Emit ("  %%t%u = add %s 0, %lld\n", val, LLVM_Rep_To_String (dt),
                  (long long)sub_type->record.disc_constraint_values[di]);
             }
             if (val > 0)
@@ -38980,85 +39045,85 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   // Raises CONSTRAINT_ERROR on any malformed input.                                               
   //                                                                                                
   Emit ("; Integer'VALUE helper (based literals + validation)\n");
-  Emit ("define linkonce_odr %s @__ada_integer_value(" FAT_PTR_TYPE " %%str) {\n", iat);
+  Emit ("define linkonce_odr %s @__ada_integer_value(" FAT_PTR_TYPE " %%str) {\n", LLVM_Rep_To_String (iat));
   Emit ("entry:\n");
   Emit_Fat_Pointer_Extractvalue_Named ("str", "data", "low_bt", "high_bt", rts_sbt);
-  Emit ("  %%len = sub %s %%high_bt, %%low_bt\n", rts_sbt);
-  Emit ("  %%len1 = add %s %%len, 1\n", rts_sbt);
+  Emit ("  %%len = sub %s %%high_bt, %%low_bt\n", LLVM_Rep_To_String (rts_sbt));
+  Emit ("  %%len1 = add %s %%len, 1\n", LLVM_Rep_To_String (rts_sbt));
 
   // Copy to NUL-terminated C buffer for sscanf-like processing in C helper
-  Emit ("  %%len64 = sext %s %%len1 to i64\n", rts_sbt);
+  Emit ("  %%len64 = sext %s %%len1 to i64\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  %%buf = alloca i8, i64 %%len64\n");
   Emit ("  call void @llvm.memcpy.p0.p0.i64(ptr %%buf, ptr %%data, i64 %%len64, i1 false)\n");
-  Emit ("  %%result = call %s @__ada_parse_integer(ptr %%buf, %s %%len1)\n", iat, rts_sbt);
-  Emit ("  ret %s %%result\n", iat);
+  Emit ("  %%result = call %s @__ada_parse_integer(ptr %%buf, %s %%len1)\n", LLVM_Rep_To_String (iat), LLVM_Rep_To_String (rts_sbt));
+  Emit ("  ret %s %%result\n", LLVM_Rep_To_String (iat));
   Emit ("}\n\n");
 
   // The actual parser is a C-callable function emitted as LLVM IR.                                
   // It handles spaces, sign, decimal, based literals, exponent, underscores,                       
   // and raises CONSTRAINT_ERROR on any validation failure.                                        
   //                                                                                                
-  Emit ("define linkonce_odr %s @__ada_parse_integer(ptr %%buf, %s %%len) {\n", iat, rts_sbt);
+  Emit ("define linkonce_odr %s @__ada_parse_integer(ptr %%buf, %s %%len) {\n", LLVM_Rep_To_String (iat), LLVM_Rep_To_String (rts_sbt));
   Emit ("entry:\n");
 
   // Phase 1: skip leading spaces (only ASCII 32; HT/other > error)
   Emit ("  br label %%skip_lead\n");
   Emit ("skip_lead:\n");
-  Emit ("  %%sl_i = phi %s [ 0, %%entry ], [ %%sl_ni, %%sl_cont ]\n", rts_sbt);
-  Emit ("  %%sl_done = icmp sge %s %%sl_i, %%len\n", rts_sbt);
+  Emit ("  %%sl_i = phi %s [ 0, %%entry ], [ %%sl_ni, %%sl_cont ]\n", LLVM_Rep_To_String (rts_sbt));
+  Emit ("  %%sl_done = icmp sge %s %%sl_i, %%len\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br i1 %%sl_done, label %%bad, label %%sl_body\n");
   Emit ("sl_body:\n");
-  Emit ("  %%sl_p = getelementptr i8, ptr %%buf, %s %%sl_i\n", rts_sbt);
+  Emit ("  %%sl_p = getelementptr i8, ptr %%buf, %s %%sl_i\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  %%sl_c = load i8, ptr %%sl_p\n");
   Emit ("  %%sl_sp = icmp eq i8 %%sl_c, 32\n");
   Emit ("  br i1 %%sl_sp, label %%sl_cont, label %%got_start\n");
   Emit ("sl_cont:\n");
-  Emit ("  %%sl_ni = add %s %%sl_i, 1\n", rts_sbt);
+  Emit ("  %%sl_ni = add %s %%sl_i, 1\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br label %%skip_lead\n");
 
   // Phase 2: find end (skip trailing spaces; HT/other at end > error)
   Emit ("got_start:\n");
-  Emit ("  %%end_init = sub %s %%len, 1\n", rts_sbt);
+  Emit ("  %%end_init = sub %s %%len, 1\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br label %%skip_trail\n");
   Emit ("skip_trail:\n");
-  Emit ("  %%st_i = phi %s [ %%end_init, %%got_start ], [ %%st_ni, %%st_cont ]\n", rts_sbt);
+  Emit ("  %%st_i = phi %s [ %%end_init, %%got_start ], [ %%st_ni, %%st_cont ]\n", LLVM_Rep_To_String (rts_sbt));
   // Use `slt` (strict): st_i == sl_i is a valid single-character string
   // (the char was already verified non-space in skip_lead). Only error if
   // we ran past the leading position.
-  Emit ("  %%st_le = icmp slt %s %%st_i, %%sl_i\n", rts_sbt);
+  Emit ("  %%st_le = icmp slt %s %%st_i, %%sl_i\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br i1 %%st_le, label %%bad, label %%st_body\n");
   Emit ("st_body:\n");
-  Emit ("  %%st_p = getelementptr i8, ptr %%buf, %s %%st_i\n", rts_sbt);
+  Emit ("  %%st_p = getelementptr i8, ptr %%buf, %s %%st_i\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  %%st_c = load i8, ptr %%st_p\n");
   Emit ("  %%st_sp = icmp eq i8 %%st_c, 32\n");
   Emit ("  br i1 %%st_sp, label %%st_cont, label %%trimmed\n");
   Emit ("st_cont:\n");
-  Emit ("  %%st_ni = sub %s %%st_i, 1\n", rts_sbt);
+  Emit ("  %%st_ni = sub %s %%st_i, 1\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br label %%skip_trail\n");
 
   // Now sl_i..st_i is the trimmed content (inclusive)
   Emit ("trimmed:\n");
-  Emit ("  %%end = add %s %%st_i, 1\n", rts_sbt);  // exclusive end
+  Emit ("  %%end = add %s %%st_i, 1\n", LLVM_Rep_To_String (rts_sbt));  // exclusive end
 
   // Phase 3: check for sign
-  Emit ("  %%s_p = getelementptr i8, ptr %%buf, %s %%sl_i\n", rts_sbt);
+  Emit ("  %%s_p = getelementptr i8, ptr %%buf, %s %%sl_i\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  %%s_c = load i8, ptr %%s_p\n");
   Emit ("  %%is_neg = icmp eq i8 %%s_c, 45\n");
   Emit ("  %%is_pos = icmp eq i8 %%s_c, 43\n");
   Emit ("  %%has_sign = or i1 %%is_neg, %%is_pos\n");
-  Emit ("  %%dig_start_s = add %s %%sl_i, 1\n", rts_sbt);
-  Emit ("  %%dig_start = select i1 %%has_sign, %s %%dig_start_s, %s %%sl_i\n", rts_sbt, rts_sbt);
+  Emit ("  %%dig_start_s = add %s %%sl_i, 1\n", LLVM_Rep_To_String (rts_sbt));
+  Emit ("  %%dig_start = select i1 %%has_sign, %s %%dig_start_s, %s %%sl_i\n", LLVM_Rep_To_String (rts_sbt), LLVM_Rep_To_String (rts_sbt));
 
   // Phase 4: Parse digit sequence, looking for '#' or ':' (based literal delimiter)
   Emit ("  br label %%d1loop\n");
   Emit ("d1loop:\n");
-  Emit ("  %%d1_i = phi %s [ %%dig_start, %%trimmed ], [ %%d1_ni, %%d1_cont ]\n", rts_sbt);
-  Emit ("  %%d1_val = phi %s [ 0, %%trimmed ], [ %%d1_nv, %%d1_cont ]\n", iat);
+  Emit ("  %%d1_i = phi %s [ %%dig_start, %%trimmed ], [ %%d1_ni, %%d1_cont ]\n", LLVM_Rep_To_String (rts_sbt));
+  Emit ("  %%d1_val = phi %s [ 0, %%trimmed ], [ %%d1_nv, %%d1_cont ]\n", LLVM_Rep_To_String (iat));
   Emit ("  %%d1_last_under = phi i1 [ false, %%trimmed ], [ %%d1_is_under, %%d1_cont ]\n");
-  Emit ("  %%d1_done = icmp sge %s %%d1_i, %%end\n", rts_sbt);
+  Emit ("  %%d1_done = icmp sge %s %%d1_i, %%end\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br i1 %%d1_done, label %%apply_sign, label %%d1_body\n");
   Emit ("d1_body:\n");
-  Emit ("  %%d1_p = getelementptr i8, ptr %%buf, %s %%d1_i\n", rts_sbt);
+  Emit ("  %%d1_p = getelementptr i8, ptr %%buf, %s %%d1_i\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  %%d1_ch = load i8, ptr %%d1_p\n");
 
   // Check for '#' or ':' > based literal
@@ -39082,7 +39147,7 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
 
   // Consecutive underscores or leading underscore > error
   Emit ("  %%d1_consec = and i1 %%d1_last_under, %%d1_is_under\n");
-  Emit ("  %%d1_leading = icmp eq %s %%d1_i, %%dig_start\n", rts_sbt);
+  Emit ("  %%d1_leading = icmp eq %s %%d1_i, %%dig_start\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  %%d1_bad_u = or i1 %%d1_consec, %%d1_leading\n");
   Emit ("  br i1 %%d1_bad_u, label %%bad, label %%d1_cont\n");
 
@@ -39094,36 +39159,36 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   Emit ("  br i1 %%d1_isdig, label %%d1_accum, label %%bad\n");
   Emit ("d1_accum:\n");
   Emit ("  %%d1_d = sub i8 %%d1_ch, 48\n");
-  Emit ("  %%d1_dw = zext i8 %%d1_d to %s\n", iat);
-  Emit ("  %%d1_mul = mul %s %%d1_val, 10\n", iat);
-  Emit ("  %%d1_nv_a = add %s %%d1_mul, %%d1_dw\n", iat);
+  Emit ("  %%d1_dw = zext i8 %%d1_d to %s\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%d1_mul = mul %s %%d1_val, 10\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%d1_nv_a = add %s %%d1_mul, %%d1_dw\n", LLVM_Rep_To_String (iat));
   Emit ("  br label %%d1_cont\n");
   Emit ("d1_cont:\n");
-  Emit ("  %%d1_nv = phi %s [ %%d1_nv_a, %%d1_accum ], [ %%d1_val, %%d1_under ]\n", iat);
-  Emit ("  %%d1_ni = add %s %%d1_i, 1\n", rts_sbt);
+  Emit ("  %%d1_nv = phi %s [ %%d1_nv_a, %%d1_accum ], [ %%d1_val, %%d1_under ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%d1_ni = add %s %%d1_i, 1\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br label %%d1loop\n");
 
   // Based literal: d1_val is the base, parse digits in that base until '#'/':'
   Emit ("start_based:\n");
-  Emit ("  %%base = add %s %%d1_val, 0\n", iat);  // copy
+  Emit ("  %%base = add %s %%d1_val, 0\n", LLVM_Rep_To_String (iat));  // copy
 
   // Validate base: 2..16
-  Emit ("  %%base_lo = icmp slt %s %%base, 2\n", iat);
-  Emit ("  %%base_hi = icmp sgt %s %%base, 16\n", iat);
+  Emit ("  %%base_lo = icmp slt %s %%base, 2\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%base_hi = icmp sgt %s %%base, 16\n", LLVM_Rep_To_String (iat));
   Emit ("  %%base_bad = or i1 %%base_lo, %%base_hi\n");
   Emit ("  br i1 %%base_bad, label %%bad, label %%based_ok\n");
   Emit ("based_ok:\n");
   Emit ("  %%b_delim = add i8 %%d1_ch, 0\n");  // remember delimiter
-  Emit ("  %%b_start = add %s %%d1_i, 1\n", rts_sbt);
+  Emit ("  %%b_start = add %s %%d1_i, 1\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br label %%bloop\n");
   Emit ("bloop:\n");
-  Emit ("  %%b_i = phi %s [ %%b_start, %%based_ok ], [ %%b_ni, %%b_cont ]\n", rts_sbt);
-  Emit ("  %%b_val = phi %s [ 0, %%based_ok ], [ %%b_nv, %%b_cont ]\n", iat);
+  Emit ("  %%b_i = phi %s [ %%b_start, %%based_ok ], [ %%b_ni, %%b_cont ]\n", LLVM_Rep_To_String (rts_sbt));
+  Emit ("  %%b_val = phi %s [ 0, %%based_ok ], [ %%b_nv, %%b_cont ]\n", LLVM_Rep_To_String (iat));
   Emit ("  %%b_last_under = phi i1 [ false, %%based_ok ], [ %%b_is_under, %%b_cont ]\n");
-  Emit ("  %%b_done = icmp sge %s %%b_i, %%end\n", rts_sbt);
+  Emit ("  %%b_done = icmp sge %s %%b_i, %%end\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br i1 %%b_done, label %%bad, label %%b_body\n");  // missing closing delimiter
   Emit ("b_body:\n");
-  Emit ("  %%b_p = getelementptr i8, ptr %%buf, %s %%b_i\n", rts_sbt);
+  Emit ("  %%b_p = getelementptr i8, ptr %%buf, %s %%b_i\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  %%b_ch = load i8, ptr %%b_p\n");
 
   // Check for closing delimiter
@@ -39136,7 +39201,7 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   Emit ("  br i1 %%b_is_under, label %%b_under, label %%b_hexdig\n");
   Emit ("b_under:\n");
   Emit ("  %%b_consec = and i1 %%b_last_under, %%b_is_under\n");
-  Emit ("  %%b_leading_u = icmp eq %s %%b_i, %%b_start\n", rts_sbt);
+  Emit ("  %%b_leading_u = icmp eq %s %%b_i, %%b_start\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  %%b_bad_u = or i1 %%b_consec, %%b_leading_u\n");
   Emit ("  br i1 %%b_bad_u, label %%bad, label %%b_cont\n");
 
@@ -39167,27 +39232,27 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   Emit ("  br label %%b_accum\n");
   Emit ("b_accum:\n");
   Emit ("  %%b_digit = phi i8 [ %%b_d09v, %%b_d09 ], [ %%b_dAFv, %%b_dAF ], [ %%b_dafv, %%b_daf ]\n");
-  Emit ("  %%b_dw = zext i8 %%b_digit to %s\n", iat);
+  Emit ("  %%b_dw = zext i8 %%b_digit to %s\n", LLVM_Rep_To_String (iat));
 
   // Check digit < base
-  Emit ("  %%b_inrange = icmp slt %s %%b_dw, %%base\n", iat);
+  Emit ("  %%b_inrange = icmp slt %s %%b_dw, %%base\n", LLVM_Rep_To_String (iat));
   Emit ("  br i1 %%b_inrange, label %%b_ok_dig, label %%bad\n");
   Emit ("b_ok_dig:\n");
-  Emit ("  %%b_mul = mul %s %%b_val, %%base\n", iat);
-  Emit ("  %%b_nv_a = add %s %%b_mul, %%b_dw\n", iat);
+  Emit ("  %%b_mul = mul %s %%b_val, %%base\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%b_nv_a = add %s %%b_mul, %%b_dw\n", LLVM_Rep_To_String (iat));
   Emit ("  br label %%b_cont\n");
   Emit ("b_cont:\n");
-  Emit ("  %%b_nv = phi %s [ %%b_nv_a, %%b_ok_dig ], [ %%b_val, %%b_under ]\n", iat);
-  Emit ("  %%b_ni = add %s %%b_i, 1\n", rts_sbt);
+  Emit ("  %%b_nv = phi %s [ %%b_nv_a, %%b_ok_dig ], [ %%b_val, %%b_under ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%b_ni = add %s %%b_i, 1\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br label %%bloop\n");
 
   // After closing '#'/':' - check for optional exponent
   Emit ("based_done:\n");
-  Emit ("  %%bd_ni = add %s %%b_i, 1\n", rts_sbt);
-  Emit ("  %%bd_more = icmp slt %s %%bd_ni, %%end\n", rts_sbt);
+  Emit ("  %%bd_ni = add %s %%b_i, 1\n", LLVM_Rep_To_String (rts_sbt));
+  Emit ("  %%bd_more = icmp slt %s %%bd_ni, %%end\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br i1 %%bd_more, label %%bd_check_exp, label %%apply_sign_based\n");
   Emit ("bd_check_exp:\n");
-  Emit ("  %%bd_ep = getelementptr i8, ptr %%buf, %s %%bd_ni\n", rts_sbt);
+  Emit ("  %%bd_ep = getelementptr i8, ptr %%buf, %s %%bd_ni\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  %%bd_ec = load i8, ptr %%bd_ep\n");
   Emit ("  %%bd_isE = icmp eq i8 %%bd_ec, 69\n");
   Emit ("  %%bd_ise = icmp eq i8 %%bd_ec, 101\n");
@@ -39196,15 +39261,15 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
 
   // Exponent for based literal: exp_start_b, base is still %%base
   Emit ("exp_start_b:\n");
-  Emit ("  %%eb_s = add %s %%bd_ni, 1\n", rts_sbt);
+  Emit ("  %%eb_s = add %s %%bd_ni, 1\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br label %%ebloop\n");
   Emit ("ebloop:\n");
-  Emit ("  %%eb_i = phi %s [ %%eb_s, %%exp_start_b ], [ %%eb_ni, %%eb_cont ]\n", rts_sbt);
-  Emit ("  %%eb_v = phi %s [ 0, %%exp_start_b ], [ %%eb_nv, %%eb_cont ]\n", iat);
-  Emit ("  %%eb_done = icmp sge %s %%eb_i, %%end\n", rts_sbt);
+  Emit ("  %%eb_i = phi %s [ %%eb_s, %%exp_start_b ], [ %%eb_ni, %%eb_cont ]\n", LLVM_Rep_To_String (rts_sbt));
+  Emit ("  %%eb_v = phi %s [ 0, %%exp_start_b ], [ %%eb_nv, %%eb_cont ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%eb_done = icmp sge %s %%eb_i, %%end\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br i1 %%eb_done, label %%apply_exp_based, label %%eb_body\n");
   Emit ("eb_body:\n");
-  Emit ("  %%eb_p = getelementptr i8, ptr %%buf, %s %%eb_i\n", rts_sbt);
+  Emit ("  %%eb_p = getelementptr i8, ptr %%buf, %s %%eb_i\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  %%eb_c = load i8, ptr %%eb_p\n");
   Emit ("  %%eb_ge0 = icmp uge i8 %%eb_c, 48\n");
   Emit ("  %%eb_le9 = icmp ule i8 %%eb_c, 57\n");
@@ -39212,38 +39277,38 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   Emit ("  br i1 %%eb_isdig, label %%eb_accum, label %%eb_skip\n");
   Emit ("eb_accum:\n");
   Emit ("  %%eb_d = sub i8 %%eb_c, 48\n");
-  Emit ("  %%eb_dw = zext i8 %%eb_d to %s\n", iat);
-  Emit ("  %%eb_mul = mul %s %%eb_v, 10\n", iat);
-  Emit ("  %%eb_nv_a = add %s %%eb_mul, %%eb_dw\n", iat);
+  Emit ("  %%eb_dw = zext i8 %%eb_d to %s\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%eb_mul = mul %s %%eb_v, 10\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%eb_nv_a = add %s %%eb_mul, %%eb_dw\n", LLVM_Rep_To_String (iat));
   Emit ("  br label %%eb_cont\n");
   Emit ("eb_skip:\n");  // skip + sign
   Emit ("  br label %%eb_cont\n");
   Emit ("eb_cont:\n");
-  Emit ("  %%eb_nv = phi %s [ %%eb_nv_a, %%eb_accum ], [ %%eb_v, %%eb_skip ]\n", iat);
-  Emit ("  %%eb_ni = add %s %%eb_i, 1\n", rts_sbt);
+  Emit ("  %%eb_nv = phi %s [ %%eb_nv_a, %%eb_accum ], [ %%eb_v, %%eb_skip ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%eb_ni = add %s %%eb_i, 1\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br label %%ebloop\n");
 
   // Apply exponent for based literal: result = b_val * base^exp
   Emit ("apply_exp_based:\n");
   Emit ("  br label %%bpow_loop\n");
   Emit ("bpow_loop:\n");
-  Emit ("  %%bp_acc = phi %s [ 1, %%apply_exp_based ], [ %%bp_next, %%bpow_body ]\n", iat);
-  Emit ("  %%bp_rem = phi %s [ %%eb_v, %%apply_exp_based ], [ %%bp_dec, %%bpow_body ]\n", iat);
-  Emit ("  %%bp_done = icmp sle %s %%bp_rem, 0\n", iat);
+  Emit ("  %%bp_acc = phi %s [ 1, %%apply_exp_based ], [ %%bp_next, %%bpow_body ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%bp_rem = phi %s [ %%eb_v, %%apply_exp_based ], [ %%bp_dec, %%bpow_body ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%bp_done = icmp sle %s %%bp_rem, 0\n", LLVM_Rep_To_String (iat));
   Emit ("  br i1 %%bp_done, label %%apply_sign_based_e, label %%bpow_body\n");
   Emit ("bpow_body:\n");
-  Emit ("  %%bp_next = mul %s %%bp_acc, %%base\n", iat);
-  Emit ("  %%bp_dec = sub %s %%bp_rem, 1\n", iat);
+  Emit ("  %%bp_next = mul %s %%bp_acc, %%base\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%bp_dec = sub %s %%bp_rem, 1\n", LLVM_Rep_To_String (iat));
   Emit ("  br label %%bpow_loop\n");
   Emit ("apply_sign_based_e:\n");
-  Emit ("  %%based_scaled = mul %s %%b_val, %%bp_acc\n", iat);
-  Emit ("  %%neg_based_e = sub %s 0, %%based_scaled\n", iat);
-  Emit ("  %%ret_based_e = select i1 %%is_neg, %s %%neg_based_e, %s %%based_scaled\n", iat, iat);
-  Emit ("  ret %s %%ret_based_e\n", iat);
+  Emit ("  %%based_scaled = mul %s %%b_val, %%bp_acc\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%neg_based_e = sub %s 0, %%based_scaled\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%ret_based_e = select i1 %%is_neg, %s %%neg_based_e, %s %%based_scaled\n", LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat));
+  Emit ("  ret %s %%ret_based_e\n", LLVM_Rep_To_String (iat));
   Emit ("apply_sign_based:\n");
-  Emit ("  %%neg_based = sub %s 0, %%b_val\n", iat);
-  Emit ("  %%ret_based = select i1 %%is_neg, %s %%neg_based, %s %%b_val\n", iat, iat);
-  Emit ("  ret %s %%ret_based\n", iat);
+  Emit ("  %%neg_based = sub %s 0, %%b_val\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%ret_based = select i1 %%is_neg, %s %%neg_based, %s %%b_val\n", LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat));
+  Emit ("  ret %s %%ret_based\n", LLVM_Rep_To_String (iat));
 
   // Decimal exponent path
   Emit ("exp_start_d:\n");
@@ -39251,11 +39316,11 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   // Check for trailing underscore before E
   Emit ("  br i1 %%d1_last_under, label %%bad, label %%exp_d_ok\n");
   Emit ("exp_d_ok:\n");
-  Emit ("  %%ed_s = add %s %%d1_i, 1\n", rts_sbt);
+  Emit ("  %%ed_s = add %s %%d1_i, 1\n", LLVM_Rep_To_String (rts_sbt));
 
   // Check first char after E: must be digit or '+'; '-' > error
-  Emit ("  %%ed_first_p = getelementptr i8, ptr %%buf, %s %%ed_s\n", rts_sbt);
-  Emit ("  %%ed_first_done = icmp sge %s %%ed_s, %%end\n", rts_sbt);
+  Emit ("  %%ed_first_p = getelementptr i8, ptr %%buf, %s %%ed_s\n", LLVM_Rep_To_String (rts_sbt));
+  Emit ("  %%ed_first_done = icmp sge %s %%ed_s, %%end\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br i1 %%ed_first_done, label %%bad, label %%ed_check_first\n");
   Emit ("ed_check_first:\n");
   Emit ("  %%ed_fc = load i8, ptr %%ed_first_p\n");
@@ -39263,8 +39328,8 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   Emit ("  br i1 %%ed_fc_minus, label %%bad, label %%ed_fc_plus\n");
   Emit ("ed_fc_plus:\n");
   Emit ("  %%ed_fc_isplus = icmp eq i8 %%ed_fc, 43\n");
-  Emit ("  %%ed_s2 = add %s %%ed_s, 1\n", rts_sbt);
-  Emit ("  %%ed_real_s = select i1 %%ed_fc_isplus, %s %%ed_s2, %s %%ed_s\n", rts_sbt, rts_sbt);
+  Emit ("  %%ed_s2 = add %s %%ed_s, 1\n", LLVM_Rep_To_String (rts_sbt));
+  Emit ("  %%ed_real_s = select i1 %%ed_fc_isplus, %s %%ed_s2, %s %%ed_s\n", LLVM_Rep_To_String (rts_sbt), LLVM_Rep_To_String (rts_sbt));
 
   // First char after E (or E+) must be a digit, not underscore or other
   Emit ("  %%ed_fc_ge0 = icmp uge i8 %%ed_fc, 48\n");
@@ -39273,17 +39338,17 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   Emit ("  %%ed_fc_ok = or i1 %%ed_fc_isplus, %%ed_fc_isdig\n");
   Emit ("  br i1 %%ed_fc_ok, label %%edloop, label %%bad\n");
   Emit ("edloop:\n");
-  Emit ("  %%ed_i = phi %s [ %%ed_real_s, %%ed_fc_plus ], [ %%ed_ni, %%ed_cont ]\n", rts_sbt);
-  Emit ("  %%ed_v = phi %s [ 0, %%ed_fc_plus ], [ %%ed_nv, %%ed_cont ]\n", iat);
+  Emit ("  %%ed_i = phi %s [ %%ed_real_s, %%ed_fc_plus ], [ %%ed_ni, %%ed_cont ]\n", LLVM_Rep_To_String (rts_sbt));
+  Emit ("  %%ed_v = phi %s [ 0, %%ed_fc_plus ], [ %%ed_nv, %%ed_cont ]\n", LLVM_Rep_To_String (iat));
   Emit ("  %%ed_had_dig = phi i1 [ false, %%ed_fc_plus ], [ true, %%ed_cont ]\n");
-  Emit ("  %%ed_done = icmp sge %s %%ed_i, %%end\n", rts_sbt);
+  Emit ("  %%ed_done = icmp sge %s %%ed_i, %%end\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br i1 %%ed_done, label %%ed_check_end, label %%ed_body\n");
   Emit ("ed_check_end:\n");
 
   // Must have seen at least one digit
   Emit ("  br i1 %%ed_had_dig, label %%apply_exp_d, label %%bad\n");
   Emit ("ed_body:\n");
-  Emit ("  %%ed_p = getelementptr i8, ptr %%buf, %s %%ed_i\n", rts_sbt);
+  Emit ("  %%ed_p = getelementptr i8, ptr %%buf, %s %%ed_i\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  %%ed_c = load i8, ptr %%ed_p\n");
   Emit ("  %%ed_ge0 = icmp uge i8 %%ed_c, 48\n");
   Emit ("  %%ed_le9 = icmp ule i8 %%ed_c, 57\n");
@@ -39296,32 +39361,32 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   Emit ("  br i1 %%ed_is_u, label %%ed_cont, label %%bad\n");
   Emit ("ed_accum:\n");
   Emit ("  %%ed_d = sub i8 %%ed_c, 48\n");
-  Emit ("  %%ed_dw = zext i8 %%ed_d to %s\n", iat);
-  Emit ("  %%ed_mul = mul %s %%ed_v, 10\n", iat);
-  Emit ("  %%ed_nv_a = add %s %%ed_mul, %%ed_dw\n", iat);
+  Emit ("  %%ed_dw = zext i8 %%ed_d to %s\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%ed_mul = mul %s %%ed_v, 10\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%ed_nv_a = add %s %%ed_mul, %%ed_dw\n", LLVM_Rep_To_String (iat));
   Emit ("  br label %%ed_cont\n");
   Emit ("ed_cont:\n");
-  Emit ("  %%ed_nv = phi %s [ %%ed_nv_a, %%ed_accum ], [ %%ed_v, %%ed_check_u ]\n", iat);
-  Emit ("  %%ed_ni = add %s %%ed_i, 1\n", rts_sbt);
+  Emit ("  %%ed_nv = phi %s [ %%ed_nv_a, %%ed_accum ], [ %%ed_v, %%ed_check_u ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%ed_ni = add %s %%ed_i, 1\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br label %%edloop\n");
 
   // Apply decimal exponent: result = mantissa * 10^exp
   Emit ("apply_exp_d:\n");
   Emit ("  br label %%dpow_loop\n");
   Emit ("dpow_loop:\n");
-  Emit ("  %%dp_acc = phi %s [ 1, %%apply_exp_d ], [ %%dp_next, %%dpow_body ]\n", iat);
-  Emit ("  %%dp_rem = phi %s [ %%ed_v, %%apply_exp_d ], [ %%dp_dec, %%dpow_body ]\n", iat);
-  Emit ("  %%dp_done = icmp sle %s %%dp_rem, 0\n", iat);
+  Emit ("  %%dp_acc = phi %s [ 1, %%apply_exp_d ], [ %%dp_next, %%dpow_body ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%dp_rem = phi %s [ %%ed_v, %%apply_exp_d ], [ %%dp_dec, %%dpow_body ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%dp_done = icmp sle %s %%dp_rem, 0\n", LLVM_Rep_To_String (iat));
   Emit ("  br i1 %%dp_done, label %%apply_sign_de, label %%dpow_body\n");
   Emit ("dpow_body:\n");
-  Emit ("  %%dp_next = mul %s %%dp_acc, 10\n", iat);
-  Emit ("  %%dp_dec = sub %s %%dp_rem, 1\n", iat);
+  Emit ("  %%dp_next = mul %s %%dp_acc, 10\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%dp_dec = sub %s %%dp_rem, 1\n", LLVM_Rep_To_String (iat));
   Emit ("  br label %%dpow_loop\n");
   Emit ("apply_sign_de:\n");
-  Emit ("  %%de_scaled = mul %s %%d1_val, %%dp_acc\n", iat);
-  Emit ("  %%neg_de = sub %s 0, %%de_scaled\n", iat);
-  Emit ("  %%ret_de = select i1 %%is_neg, %s %%neg_de, %s %%de_scaled\n", iat, iat);
-  Emit ("  ret %s %%ret_de\n", iat);
+  Emit ("  %%de_scaled = mul %s %%d1_val, %%dp_acc\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%neg_de = sub %s 0, %%de_scaled\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%ret_de = select i1 %%is_neg, %s %%neg_de, %s %%de_scaled\n", LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat));
+  Emit ("  ret %s %%ret_de\n", LLVM_Rep_To_String (iat));
 
   // Simple decimal result (no exponent, no base) - apply sign
   Emit ("apply_sign:\n");
@@ -39329,9 +39394,9 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   // Check for trailing underscore
   Emit ("  br i1 %%d1_last_under, label %%bad, label %%apply_sign_ok\n");
   Emit ("apply_sign_ok:\n");
-  Emit ("  %%neg_d = sub %s 0, %%d1_val\n", iat);
-  Emit ("  %%ret_d = select i1 %%is_neg, %s %%neg_d, %s %%d1_val\n", iat, iat);
-  Emit ("  ret %s %%ret_d\n", iat);
+  Emit ("  %%neg_d = sub %s 0, %%d1_val\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%ret_d = select i1 %%is_neg, %s %%neg_d, %s %%d1_val\n", LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat));
+  Emit ("  ret %s %%ret_d\n", LLVM_Rep_To_String (iat));
 
   // Error: raise CONSTRAINT_ERROR
   Emit ("bad:\n");
@@ -39355,11 +39420,11 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   // Raises Constraint_Error on negative exponent or overflow.                                     
   //                                                                                                
   Emit ("; Integer exponentiation helper (signed, overflow-checked, binary exp)\n");
-  Emit ("define linkonce_odr %s @__ada_integer_pow (%s %%base, %s %%exp) {\n", iat, iat, iat);
+  Emit ("define linkonce_odr %s @__ada_integer_pow (%s %%base, %s %%exp) {\n", LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat));
   Emit ("entry:\n");
 
   // Check for negative exponent
-  Emit ("  %%is_neg = icmp slt %s %%exp, 0\n", iat);
+  Emit ("  %%is_neg = icmp slt %s %%exp, 0\n", LLVM_Rep_To_String (iat));
   Emit ("  br i1 %%is_neg, label %%neg_exp, label %%check_zero\n");
   Emit ("neg_exp:\n");
   Emit ("  %%exc_ptr_neg = ptrtoint ptr @__exc.constraint_error to " PTR_INT_TYPE "\n");
@@ -39368,90 +39433,90 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   Emit ("check_zero:\n");
 
   // exp == 0 -> return 1
-  Emit ("  %%is_zero = icmp eq %s %%exp, 0\n", iat);
+  Emit ("  %%is_zero = icmp eq %s %%exp, 0\n", LLVM_Rep_To_String (iat));
   Emit ("  br i1 %%is_zero, label %%ret_one, label %%loop\n");
   Emit ("ret_one:\n");
-  Emit ("  ret %s 1\n", iat);
+  Emit ("  ret %s 1\n", LLVM_Rep_To_String (iat));
 
   // Binary exponentiation loop: result *= b when e is odd, b *= b, e /= 2
   Emit ("loop:\n");
-  Emit ("  %%result = phi %s [ 1, %%check_zero ], [ %%new_result, %%cont ]\n", iat);
-  Emit ("  %%b = phi %s [ %%base, %%check_zero ], [ %%new_b, %%cont ]\n", iat);
-  Emit ("  %%e = phi %s [ %%exp, %%check_zero ], [ %%new_e, %%cont ]\n", iat);
+  Emit ("  %%result = phi %s [ 1, %%check_zero ], [ %%new_result, %%cont ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%b = phi %s [ %%base, %%check_zero ], [ %%new_b, %%cont ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%e = phi %s [ %%exp, %%check_zero ], [ %%new_e, %%cont ]\n", LLVM_Rep_To_String (iat));
 
   // Check if e is odd: e & 1
-  Emit ("  %%is_odd = and %s %%e, 1\n", iat);
-  Emit ("  %%odd_bit = icmp ne %s %%is_odd, 0\n", iat);
+  Emit ("  %%is_odd = and %s %%e, 1\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%odd_bit = icmp ne %s %%is_odd, 0\n", LLVM_Rep_To_String (iat));
   Emit ("  br i1 %%odd_bit, label %%mult_result, label %%square_base\n");
 
   // Multiply result by base (overflow checked)
   Emit ("mult_result:\n");
-  Emit ("  %%pair_r = call {%s, i1} @llvm.smul.with.overflow.%s(%s %%result, %s %%b)\n", iat, iat, iat, iat);
-  Emit ("  %%mult_r = extractvalue {%s, i1} %%pair_r, 0\n", iat);
-  Emit ("  %%ovf_r = extractvalue {%s, i1} %%pair_r, 1\n", iat);
+  Emit ("  %%pair_r = call {%s, i1} @llvm.smul.with.overflow.%s(%s %%result, %s %%b)\n", LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat));
+  Emit ("  %%mult_r = extractvalue {%s, i1} %%pair_r, 0\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%ovf_r = extractvalue {%s, i1} %%pair_r, 1\n", LLVM_Rep_To_String (iat));
   Emit ("  br i1 %%ovf_r, label %%overflow, label %%square_base\n");
 
   // Square the base for next iteration
   Emit ("square_base:\n");
-  Emit ("  %%result_sq = phi %s [ %%result, %%loop ], [ %%mult_r, %%mult_result ]\n", iat);
+  Emit ("  %%result_sq = phi %s [ %%result, %%loop ], [ %%mult_r, %%mult_result ]\n", LLVM_Rep_To_String (iat));
 
   // Halve exponent
-  Emit ("  %%new_e = lshr %s %%e, 1\n", iat);
+  Emit ("  %%new_e = lshr %s %%e, 1\n", LLVM_Rep_To_String (iat));
 
   // Check if done (e == 0 after shift)
-  Emit ("  %%done = icmp eq %s %%new_e, 0\n", iat);
+  Emit ("  %%done = icmp eq %s %%new_e, 0\n", LLVM_Rep_To_String (iat));
   Emit ("  br i1 %%done, label %%exit, label %%do_square\n");
 
   // Actually compute b*b (only if we need it for next iteration)
   Emit ("do_square:\n");
-  Emit ("  %%pair_b = call {%s, i1} @llvm.smul.with.overflow.%s(%s %%b, %s %%b)\n", iat, iat, iat, iat);
-  Emit ("  %%sq_b = extractvalue {%s, i1} %%pair_b, 0\n", iat);
-  Emit ("  %%ovf_b = extractvalue {%s, i1} %%pair_b, 1\n", iat);
+  Emit ("  %%pair_b = call {%s, i1} @llvm.smul.with.overflow.%s(%s %%b, %s %%b)\n", LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat));
+  Emit ("  %%sq_b = extractvalue {%s, i1} %%pair_b, 0\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%ovf_b = extractvalue {%s, i1} %%pair_b, 1\n", LLVM_Rep_To_String (iat));
   Emit ("  br i1 %%ovf_b, label %%overflow, label %%cont\n");
   Emit ("cont:\n");
-  Emit ("  %%new_result = phi %s [ %%result_sq, %%do_square ]\n", iat);
-  Emit ("  %%new_b = phi %s [ %%sq_b, %%do_square ]\n", iat);
+  Emit ("  %%new_result = phi %s [ %%result_sq, %%do_square ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%new_b = phi %s [ %%sq_b, %%do_square ]\n", LLVM_Rep_To_String (iat));
   Emit ("  br label %%loop\n");
   Emit ("overflow:\n");
   Emit ("  %%exc_ptr = ptrtoint ptr @__exc.constraint_error to " PTR_INT_TYPE "\n");
   Emit ("  call void @__ada_raise(i64 %%exc_ptr)\n");
   Emit ("  unreachable\n");
   Emit ("exit:\n");
-  Emit ("  ret %s %%result_sq\n", iat);
+  Emit ("  ret %s %%result_sq\n", LLVM_Rep_To_String (iat));
   Emit ("}\n\n");
 
   // Modular power function - unsigned, wrapping (RM 3.5.4).
   // Uses binary exponentiation (O(log n)), no overflow check as modular wraps.
   Emit ("; Modular exponentiation helper (unsigned, wrapping, binary exp)\n");
-  Emit ("define linkonce_odr %s @__ada_modular_pow (%s %%base, %s %%exp) {\n", iat, iat, iat);
+  Emit ("define linkonce_odr %s @__ada_modular_pow (%s %%base, %s %%exp) {\n", LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat));
   Emit ("entry:\n");
-  Emit ("  %%is_zero = icmp eq %s %%exp, 0\n", iat);
+  Emit ("  %%is_zero = icmp eq %s %%exp, 0\n", LLVM_Rep_To_String (iat));
   Emit ("  br i1 %%is_zero, label %%ret_one, label %%loop\n");
   Emit ("ret_one:\n");
-  Emit ("  ret %s 1\n", iat);
+  Emit ("  ret %s 1\n", LLVM_Rep_To_String (iat));
 
   // Binary exponentiation loop
   Emit ("loop:\n");
-  Emit ("  %%result = phi %s [ 1, %%entry ], [ %%new_result, %%cont ]\n", iat);
-  Emit ("  %%b = phi %s [ %%base, %%entry ], [ %%new_b, %%cont ]\n", iat);
-  Emit ("  %%e = phi %s [ %%exp, %%entry ], [ %%new_e, %%cont ]\n", iat);
-  Emit ("  %%is_odd = and %s %%e, 1\n", iat);
-  Emit ("  %%odd_bit = icmp ne %s %%is_odd, 0\n", iat);
+  Emit ("  %%result = phi %s [ 1, %%entry ], [ %%new_result, %%cont ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%b = phi %s [ %%base, %%entry ], [ %%new_b, %%cont ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%e = phi %s [ %%exp, %%entry ], [ %%new_e, %%cont ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%is_odd = and %s %%e, 1\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%odd_bit = icmp ne %s %%is_odd, 0\n", LLVM_Rep_To_String (iat));
   Emit ("  br i1 %%odd_bit, label %%mult, label %%square\n");
   Emit ("mult:\n");
-  Emit ("  %%mult_r = mul %s %%result, %%b\n", iat);
+  Emit ("  %%mult_r = mul %s %%result, %%b\n", LLVM_Rep_To_String (iat));
   Emit ("  br label %%square\n");
   Emit ("square:\n");
-  Emit ("  %%result_s = phi %s [ %%result, %%loop ], [ %%mult_r, %%mult ]\n", iat);
-  Emit ("  %%new_e = lshr %s %%e, 1\n", iat);
-  Emit ("  %%done = icmp eq %s %%new_e, 0\n", iat);
+  Emit ("  %%result_s = phi %s [ %%result, %%loop ], [ %%mult_r, %%mult ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%new_e = lshr %s %%e, 1\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%done = icmp eq %s %%new_e, 0\n", LLVM_Rep_To_String (iat));
   Emit ("  br i1 %%done, label %%exit, label %%cont\n");
   Emit ("cont:\n");
-  Emit ("  %%new_result = phi %s [ %%result_s, %%square ]\n", iat);
-  Emit ("  %%new_b = mul %s %%b, %%b\n", iat);
+  Emit ("  %%new_result = phi %s [ %%result_s, %%square ]\n", LLVM_Rep_To_String (iat));
+  Emit ("  %%new_b = mul %s %%b, %%b\n", LLVM_Rep_To_String (iat));
   Emit ("  br label %%loop\n");
   Emit ("exit:\n");
-  Emit ("  ret %s %%result_s\n", iat);
+  Emit ("  ret %s %%result_s\n", LLVM_Rep_To_String (iat));
   Emit ("}\n\n");
 
   // String trim helpers for Enum'VALUE (Ada RM 3.5): count leading/trailing
@@ -39462,49 +39527,49 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
     Emit ("; String trim helpers for VALUE attribute\n");
 
     // count_leading_spaces(ptr data, iN len) -> iN
-    Emit ("define linkonce_odr %s @__ada_count_leading_spaces(ptr %%d, %s %%len) {\n", iat, iat);
+    Emit ("define linkonce_odr %s @__ada_count_leading_spaces(ptr %%d, %s %%len) {\n", LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat));
     Emit ("entry:\n  br label %%loop\n");
     Emit ("loop:\n");
-    Emit ("  %%i = phi %s [ 0, %%entry ], [ %%ni, %%cont ]\n", iat);
-    Emit ("  %%done = icmp sge %s %%i, %%len\n", iat);
+    Emit ("  %%i = phi %s [ 0, %%entry ], [ %%ni, %%cont ]\n", LLVM_Rep_To_String (iat));
+    Emit ("  %%done = icmp sge %s %%i, %%len\n", LLVM_Rep_To_String (iat));
     Emit ("  br i1 %%done, label %%exit, label %%body\n");
     Emit ("body:\n");
-    Emit ("  %%p = getelementptr i8, ptr %%d, %s %%i\n", iat);
+    Emit ("  %%p = getelementptr i8, ptr %%d, %s %%i\n", LLVM_Rep_To_String (iat));
     Emit ("  %%c = load i8, ptr %%p\n");
     Emit ("  %%sp = icmp eq i8 %%c, 32\n");
     Emit ("  br i1 %%sp, label %%cont, label %%exit\n");
     Emit ("cont:\n");
-    Emit ("  %%ni = add %s %%i, 1\n", iat);
+    Emit ("  %%ni = add %s %%i, 1\n", LLVM_Rep_To_String (iat));
     Emit ("  br label %%loop\n");
     Emit ("exit:\n");
-    Emit ("  %%r = phi %s [ %%i, %%loop ], [ %%i, %%body ]\n", iat);
-    Emit ("  ret %s %%r\n", iat);
+    Emit ("  %%r = phi %s [ %%i, %%loop ], [ %%i, %%body ]\n", LLVM_Rep_To_String (iat));
+    Emit ("  ret %s %%r\n", LLVM_Rep_To_String (iat));
     Emit ("}\n\n");
 
     // count_trailing_spaces(ptr data, iN len) -> iN
-    Emit ("define linkonce_odr %s @__ada_count_trailing_spaces(ptr %%d, %s %%len) {\n", iat, iat);
+    Emit ("define linkonce_odr %s @__ada_count_trailing_spaces(ptr %%d, %s %%len) {\n", LLVM_Rep_To_String (iat), LLVM_Rep_To_String (iat));
     Emit ("entry:\n");
-    Emit ("  %%start = sub %s %%len, 1\n", iat);
+    Emit ("  %%start = sub %s %%len, 1\n", LLVM_Rep_To_String (iat));
     Emit ("  br label %%loop\n");
     Emit ("loop:\n");
-    Emit ("  %%i = phi %s [ %%start, %%entry ], [ %%ni, %%cont ]\n", iat);
-    Emit ("  %%done = icmp slt %s %%i, 0\n", iat);
+    Emit ("  %%i = phi %s [ %%start, %%entry ], [ %%ni, %%cont ]\n", LLVM_Rep_To_String (iat));
+    Emit ("  %%done = icmp slt %s %%i, 0\n", LLVM_Rep_To_String (iat));
     Emit ("  br i1 %%done, label %%exit, label %%body\n");
     Emit ("body:\n");
-    Emit ("  %%p = getelementptr i8, ptr %%d, %s %%i\n", iat);
+    Emit ("  %%p = getelementptr i8, ptr %%d, %s %%i\n", LLVM_Rep_To_String (iat));
     Emit ("  %%c = load i8, ptr %%p\n");
     Emit ("  %%sp = icmp eq i8 %%c, 32\n");
     Emit ("  br i1 %%sp, label %%cont, label %%exit\n");
     Emit ("cont:\n");
-    Emit ("  %%ni = sub %s %%i, 1\n", iat);
+    Emit ("  %%ni = sub %s %%i, 1\n", LLVM_Rep_To_String (iat));
     Emit ("  br label %%loop\n");
     Emit ("exit:\n");
 
     // trailing count = len - 1 - i (when i is last non-space index) or len (all spaces)
-    Emit ("  %%last = phi %s [ -1, %%loop ], [ %%i, %%body ]\n", iat);
-    Emit ("  %%r = sub %s %%len, %%last\n", iat);
-    Emit ("  %%r2 = sub %s %%r, 1\n", iat);
-    Emit ("  ret %s %%r2\n", iat);
+    Emit ("  %%last = phi %s [ -1, %%loop ], [ %%i, %%body ]\n", LLVM_Rep_To_String (iat));
+    Emit ("  %%r = sub %s %%len, %%last\n", LLVM_Rep_To_String (iat));
+    Emit ("  %%r2 = sub %s %%r, 1\n", LLVM_Rep_To_String (iat));
+    Emit ("  ret %s %%r2\n", LLVM_Rep_To_String (iat));
     Emit ("}\n\n");
   }
 
@@ -39908,7 +39973,7 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   Emit ("declare i32 @fprintf (ptr, ptr, ...)\n");
 
   // Format string depends on INTEGER width: %d for i32, %lld for i64
-  if (strcmp (iat, "i32") == 0)
+  if (LLVM_Rep_Bits (iat) == 32)
     Emit ("@.fmt_d = linkonce_odr constant [3 x i8] c\"%%d\\00\"\n");
   else
     Emit ("@.fmt_d = linkonce_odr constant [5 x i8] c\"%%lld\\00\"\n");
@@ -39934,20 +39999,20 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   // PUT: output string (ptr + bounds in native STRING bound type).
   // Bound type derived from STRING's index type via type system.
   Emit ("define linkonce_odr void @__text_io_put(ptr %%data, %s %%lo, %s %%hi) {\n",
-     rts_sbt, rts_sbt);
+     LLVM_Rep_To_String (rts_sbt), LLVM_Rep_To_String (rts_sbt));
   Emit ("entry:\n");
   Emit ("  %%out = load ptr, ptr @stdout\n");
-  Emit ("  %%i.init = sub %s %%lo, 1\n", rts_sbt);
+  Emit ("  %%i.init = sub %s %%lo, 1\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br label %%loop\n");
   Emit ("loop:\n");
-  Emit ("  %%i = phi %s [ %%i.init, %%entry ], [ %%i.next, %%body ]\n", rts_sbt);
-  Emit ("  %%i.next = add %s %%i, 1\n", rts_sbt);
-  Emit ("  %%done = icmp sgt %s %%i.next, %%hi\n", rts_sbt);
+  Emit ("  %%i = phi %s [ %%i.init, %%entry ], [ %%i.next, %%body ]\n", LLVM_Rep_To_String (rts_sbt));
+  Emit ("  %%i.next = add %s %%i, 1\n", LLVM_Rep_To_String (rts_sbt));
+  Emit ("  %%done = icmp sgt %s %%i.next, %%hi\n", LLVM_Rep_To_String (rts_sbt));
   Emit ("  br i1 %%done, label %%exit, label %%body\n");
   Emit ("body:\n");
-  Emit ("  %%idx_bt = sub %s %%i.next, %%lo\n", rts_sbt);
+  Emit ("  %%idx_bt = sub %s %%i.next, %%lo\n", LLVM_Rep_To_String (rts_sbt));
   Emit_Widen_Named_For_Intrinsic ("idx_bt", "idx", rts_sbt);
-  Emit ("  %%ptr = getelementptr i8, ptr %%data, %s %%idx\n", iat);
+  Emit ("  %%ptr = getelementptr i8, ptr %%data, %s %%idx\n", LLVM_Rep_To_String (iat));
   Emit ("  %%ch = load i8, ptr %%ptr\n");
   Emit ("  %%chi = zext i8 %%ch to i32\n");
   Emit ("  call i32 @fputc(i32 %%chi, ptr %%out)\n");
@@ -39958,17 +40023,17 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
 
   // PUT_LINE: output string followed by newline
   Emit ("define linkonce_odr void @__text_io_put_line(ptr %%data, %s %%lo, %s %%hi) {\n",
-     rts_sbt, rts_sbt);
+     LLVM_Rep_To_String (rts_sbt), LLVM_Rep_To_String (rts_sbt));
   Emit ("  call void @__text_io_put(ptr %%data, %s %%lo, %s %%hi)\n",
-     rts_sbt, rts_sbt);
+     LLVM_Rep_To_String (rts_sbt), LLVM_Rep_To_String (rts_sbt));
   Emit ("  call void @__text_io_new_line()\n");
   Emit ("  ret void\n");
   Emit ("}\n\n");
 
   // PUT_INTEGER: output integer with optional width
-  Emit ("define linkonce_odr void @__text_io_put_int(%s %%val, i32 %%width) {\n", iat);
+  Emit ("define linkonce_odr void @__text_io_put_int(%s %%val, i32 %%width) {\n", LLVM_Rep_To_String (iat));
   Emit ("  %%out = load ptr, ptr @stdout\n");
-  Emit ("  call i32 (ptr, ptr, ...) @fprintf (ptr %%out, ptr @.fmt_d, %s %%val)\n", iat);
+  Emit ("  call i32 (ptr, ptr, ...) @fprintf (ptr %%out, ptr @.fmt_d, %s %%val)\n", LLVM_Rep_To_String (iat));
   Emit ("  ret void\n");
   Emit ("}\n\n");
 
@@ -39991,8 +40056,8 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   // Bounds use STRING bound type derived from type system.
   {
     char lo_expr[64], hi_empty_expr[64];
-    snprintf (lo_expr, sizeof (lo_expr), "%s 1", rts_sbt);
-    snprintf (hi_empty_expr, sizeof (hi_empty_expr), "%s 0", rts_sbt);
+    snprintf (lo_expr, sizeof (lo_expr), "%s 1", LLVM_Rep_To_String (rts_sbt));
+    snprintf (hi_empty_expr, sizeof (hi_empty_expr), "%s 0", LLVM_Rep_To_String (rts_sbt));
     Emit ("define linkonce_odr " FAT_PTR_TYPE " @__text_io_get_line() {\n");
     Emit ("entry:\n");
     Emit ("  %%buf = call ptr @__ada_sec_stack_alloc(i64 256)\n");
@@ -40013,10 +40078,10 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
     Emit ("  %%adjlen = select i1 %%isnl, i64 %%lastidx, i64 %%len\n");
 
     // adjlen is i64 from strlen; trunc directly to bound type
-    Emit ("  %%adjlen_bt = trunc i64 %%adjlen to %s\n", rts_sbt);
+    Emit ("  %%adjlen_bt = trunc i64 %%adjlen to %s\n", LLVM_Rep_To_String (rts_sbt));
     {
       char hi_expr[64];
-      snprintf (hi_expr, sizeof (hi_expr), "%s %%adjlen_bt", rts_sbt);
+      snprintf (hi_expr, sizeof (hi_expr), "%s %%adjlen_bt", LLVM_Rep_To_String (rts_sbt));
       Emit_Fat_Pointer_Insertvalue_Named ("f", "ptr %buf", lo_expr, hi_expr, rts_sbt);
     }
     Emit ("  ret " FAT_PTR_TYPE " %%f2\n");
@@ -40027,7 +40092,7 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   Emit ("; Attribute runtime support\n");
   Emit ("declare i32 @snprintf (ptr, i64, ptr, ...)\n");
   Emit ("declare i64 @strlen (ptr)\n");
-  if (strcmp (iat, "i32") == 0)
+  if (LLVM_Rep_Bits (iat) == 32)
     Emit ("@.img_fmt_d = linkonce_odr constant [4 x i8] c\"%% d\\00\"\n");
   else
     Emit ("@.img_fmt_d = linkonce_odr constant [6 x i8] c\"%% lld\\00\"\n");
@@ -40038,20 +40103,20 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
   // Bounds use STRING bound type derived from type system.
   {
     char lo_expr[64], hi_expr[64], const3_expr[64];
-    snprintf (lo_expr, sizeof (lo_expr), "%s 1", rts_sbt);
-    Emit ("define linkonce_odr " FAT_PTR_TYPE " @__ada_integer_image(%s %%val) {\n", iat);
+    snprintf (lo_expr, sizeof (lo_expr), "%s 1", LLVM_Rep_To_String (rts_sbt));
+    Emit ("define linkonce_odr " FAT_PTR_TYPE " @__ada_integer_image(%s %%val) {\n", LLVM_Rep_To_String (iat));
     Emit ("entry:\n");
     Emit ("  %%buf = call ptr @__ada_sec_stack_alloc(i64 24)\n");
-    Emit ("  %%len32 = call i32 (ptr, i64, ptr, ...) @snprintf (ptr %%buf, i64 24, ptr @.img_fmt_d, %s %%val)\n", iat);
-    Emit_Widen_Named_For_Intrinsic ("len32", "len64", "i32");  // snprintf returns i32
+    Emit ("  %%len32 = call i32 (ptr, i64, ptr, ...) @snprintf (ptr %%buf, i64 24, ptr @.img_fmt_d, %s %%val)\n", LLVM_Rep_To_String (iat));
+    Emit_Widen_Named_For_Intrinsic ("len32", "len64", LLVM_Rep_Int (32, false));  // snprintf returns i32
     Emit_Narrow_Named_From_Intrinsic ("len64", "len_bt", rts_sbt);
-    snprintf (hi_expr, sizeof (hi_expr), "%s %%len_bt", rts_sbt);
+    snprintf (hi_expr, sizeof (hi_expr), "%s %%len_bt", LLVM_Rep_To_String (rts_sbt));
     Emit_Fat_Pointer_Insertvalue_Named ("fat", "ptr %buf", lo_expr, hi_expr, rts_sbt);
     Emit ("  ret " FAT_PTR_TYPE " %%fat2\n");
     Emit ("}\n\n");
 
     // Character'IMAGE - single char to string (3 chars: 'x')
-    snprintf (const3_expr, sizeof (const3_expr), "%s 3", rts_sbt);
+    snprintf (const3_expr, sizeof (const3_expr), "%s 3", LLVM_Rep_To_String (rts_sbt));
     Emit ("define linkonce_odr " FAT_PTR_TYPE " @__ada_character_image(i8 %%val) {\n");
     Emit ("entry:\n");
     Emit ("  %%buf = call ptr @__ada_sec_stack_alloc(i64 4)\n");
@@ -40070,9 +40135,9 @@ void Generate_Compilation_Unit (Syntax_Node *node) {
     Emit ("entry:\n");
     Emit ("  %%buf = call ptr @__ada_sec_stack_alloc(i64 32)\n");
     Emit ("  %%len32 = call i32 (ptr, i64, ptr, ...) @snprintf (ptr %%buf, i64 32, ptr @.img_fmt_f, double %%val)\n");
-    Emit_Widen_Named_For_Intrinsic ("len32", "flen64", "i32");  // snprintf returns i32
+    Emit_Widen_Named_For_Intrinsic ("len32", "flen64", LLVM_Rep_Int (32, false));  // snprintf returns i32
     Emit_Narrow_Named_From_Intrinsic ("flen64", "flen_bt", rts_sbt);
-    snprintf (hi_expr, sizeof (hi_expr), "%s %%flen_bt", rts_sbt);
+    snprintf (hi_expr, sizeof (hi_expr), "%s %%flen_bt", LLVM_Rep_To_String (rts_sbt));
     Emit_Fat_Pointer_Insertvalue_Named ("fat", "ptr %buf", lo_expr, hi_expr, rts_sbt);
     Emit ("  ret " FAT_PTR_TYPE " %%fat2\n");
     Emit ("}\n\n");
@@ -40647,7 +40712,7 @@ String_Slice LLVM_Type_Basic (String_Slice ada_type) {
   // Look up in the symbol table for proper type-system derivation
   Symbol *sym = Symbol_Find (ada_type);
   if (sym and sym->type) {
-    LLVM_Rep llvm = Type_To_Rep (sym->type);
+    const char *llvm = LLVM_Rep_To_String (Type_To_Rep (sym->type));
     return (String_Slice){llvm, strlen (llvm)};
   }
 
