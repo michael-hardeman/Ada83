@@ -97,6 +97,22 @@ Per-class pass criteria the harness applies:
 - E: `TENTATIVELY PASSED` counts as pass (manual inspection class)
 - L: post-compilation; passes if the compile **or** link **or** run is rejected
 
+### Known flaky tests (lli JIT, not compiler bugs)
+
+Tasking tests flip between PASS and crash/timeout under `lli` independently of
+`ada83.c` changes: the program runs, then SIGSEGVs during process teardown
+(`_dl_fini` / `__run_exit_handlers`), or the rendezvous polling exceeds the 2 s
+harness cap. The crash stack has no Ada frame. Do **not** treat a PASS↔FAIL flip
+on these as a regression — re-run natively (often still flaky) before blaming a
+diff. Observed unstable as of this writing:
+
+- `c93001a`, `c93005a` — task activation
+- `c95034a` — rendezvous / entry calls
+- `c97203c` — `delay` / timed entry calls
+
+More c93xxx/c95xxx/c96xxx/c97xxx/c9axxx tests share this teardown crash. Verify
+real tasking regressions against a native build, and even then expect noise.
+
 ## Code architecture (`ada83.c`)
 
 The file is split into a **specification** half (forward decls, types, comments)

@@ -283,11 +283,21 @@ const char *Ali_Llvm_Int_Type (uint32_t bits) {
 #define LL_REP_VOID    ((LLVM_Rep){ LL_VOID,    0,  false })
 #define LL_REP_C_INT   ((LLVM_Rep){ LL_INT,     32, false })  // matches C_INT_TYPE
 
+// Round an integer width up to the nearest legal LLVM integer width. Enforces
+// the LLVM_Rep invariant that INT bits is one of {1, 8, 16, 32, 64, 128}, so
+// that .bits always equals the width LLVM_Rep_To_String renders. A type whose
+// byte size lowers to a non-standard bit count (e.g. a 3-byte derived type ->
+// 24 bits) is stored in the next legal register width, exactly as the IR does.
+static inline uint16_t Legal_Llvm_Int_Bits (uint16_t bits) {
+  return bits <= 1  ? 1  : bits <= 8  ? 8  : bits <= 16 ? 16 :
+         bits <= 32 ? 32 : bits <= 64 ? 64 : 128;
+}
+
 static inline LLVM_Rep LLVM_Rep_Int   (uint16_t bits, bool is_unsigned) {
-  return (LLVM_Rep){ LL_INT, bits, is_unsigned };
+  return (LLVM_Rep){ LL_INT, Legal_Llvm_Int_Bits (bits), is_unsigned };
 }
 static inline LLVM_Rep LLVM_Rep_Float (uint16_t bits) {
-  return (LLVM_Rep){ LL_FLOAT, bits, false };
+  return (LLVM_Rep){ LL_FLOAT, bits <= Width_Float ? Width_Float : Width_Double, false };
 }
 
 bool LLVM_Rep_Is_Float       (LLVM_Rep r) { return r.kind == LL_FLOAT; }
@@ -322,9 +332,11 @@ const char *LLVM_Rep_To_String (LLVM_Rep r) {
         case 32:  return "i32";
         case 64:  return "i64";
         case 128: return "i128";
-        default:  // non-standard width: round up to the next legal LLVM int width
-          return r.bits <= 1  ? "i1"  : r.bits <= 8  ? "i8"  : r.bits <= 16 ? "i16" :
-                 r.bits <= 32 ? "i32" : r.bits <= 64 ? "i64" : "i128";
+        default:  // unreachable: LLVM_Rep_Int canonicalises bits at construction
+          switch (Legal_Llvm_Int_Bits (r.bits)) {
+            case 1:  return "i1";  case 8:  return "i8";  case 16: return "i16";
+            case 32: return "i32"; case 64: return "i64"; default: return "i128";
+          }
       }
   }
   return "void";
@@ -1705,6 +1717,7 @@ void Float_Model_Parameters (const Type_Info *t,
                               int64_t         *out_mantissa,
                               int64_t         *out_emax);
 
+bool        Is_Slice_Index_Arg             (const Syntax_Node *arg);
 bool        Expression_Is_Slice             (const Syntax_Node *node);
 bool        Expression_Is_Boolean           (Syntax_Node       *node);
 bool        Expression_Is_Float             (Syntax_Node       *node);
@@ -7444,11 +7457,19 @@ bool Type_Has_Dynamic_Bounds (const Type_Info *type_info) {
 // Slices produce fat pointers at runtime even when their declared type                             
 // is constrained, so they need special handling in comparisons.                                   
 //                                                                                                  
+// A slice index argument is either an explicit range (low..high) or a 'RANGE
+// attribute (RM 4.1.2); both denote a discrete_range, not a scalar index.
+bool Is_Slice_Index_Arg (const Syntax_Node *arg) {
+  if (not arg) return false;
+  if (arg->kind == NK_RANGE) return true;
+  return arg->kind == NK_ATTRIBUTE and
+         Slice_Equal_Ignore_Case (arg->attribute.name, S("RANGE"));
+}
+
 bool Expression_Is_Slice (const Syntax_Node *node) {
   if (not node or node->kind != NK_APPLY) return false;
   for (uint32_t i = 0; i < node->apply.arguments.count; i++) {
-    Syntax_Node *arg = node->apply.arguments.items[i];
-    if (arg and arg->kind == NK_RANGE) return true;
+    if (Is_Slice_Index_Arg (node->apply.arguments.items[i])) return true;
   }
   return false;
 }
@@ -10114,8 +10135,7 @@ Type_Info *Resolve_Apply (Syntax_Node *node) {
   if (Type_Is_Array_Like (indexed_type)) {
     bool is_slice = false;
     for (uint32_t i = 0; i < arg_count; i++) {
-      Syntax_Node *arg = node->apply.arguments.items[i];
-      if (arg and arg->kind == NK_RANGE) {
+      if (Is_Slice_Index_Arg (node->apply.arguments.items[i])) {
         is_slice = true;
         break;
       }
@@ -18968,11 +18988,13 @@ uint32_t Emit_Array_Lex_Compare (uint32_t left_ptr, uint32_t right_ptr, uint32_t
   Emit ("  %%t%u = call " C_INT_TYPE " @memcmp (ptr %%t%u, ptr %%t%u, i64 %%t%u)\n",
      prefix_cmp, left_data, right_data, byte_size);
 
-  // If prefix differs, return prefix_cmp; otherwise return len_diff
+  // If prefix differs, return prefix_cmp; otherwise return len_diff. The
+  // length difference is signed (shorter array sorts first) and must match
+  // memcmp's i32 result rep; convert from the bound rep, which may be
+  // narrower, equal, or wider than i32.
   uint32_t len_diff = Emit_Temp ();
   Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", len_diff, LLVM_Rep_To_String (bt), left_len, right_len);
-  uint32_t len_diff32 = Emit_Temp ();
-  Emit ("  %%t%u = trunc %s %%t%u to i32\n", len_diff32, LLVM_Rep_To_String (bt), len_diff);
+  uint32_t len_diff32 = Emit_Convert (len_diff, bt, LL_REP_C_INT).reg;
   LLVM_I1 prefix_zero = Emit_Icmp_Const ("eq", LL_REP_C_INT, prefix_cmp, 0);
   uint32_t result = Emit_Temp ();
   Emit ("  %%t%u = select i1 %%t%u, i32 %%t%u, i32 %%t%u\n",
@@ -21077,7 +21099,8 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
     // Return fat pointer to result
     return Emit_Fat_Pointer_Dynamic (result_data, res_lo, res_hi, cat_bt);
   }
-  uint32_t left = Generate_Expression (node->binary.left).reg;
+  LLVM_Value left_v = Generate_Expression (node->binary.left);
+  uint32_t left = left_v.reg;
 
   // NK_RANGE right operand is generated inside the IN/NOT IN handler.                             
   // For membership tests (IN/NOT IN), type names are also handled specially                        
@@ -21090,7 +21113,8 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
                node->binary.right->kind == NK_QUALIFIED) and
               node->binary.right->symbol and
               node->binary.right->symbol->kind == SYMBOL_TYPE);
-  uint32_t right = (right_is_range or is_membership) ? 0 : Generate_Expression (node->binary.right).reg;
+  LLVM_Value right_v = (right_is_range or is_membership) ? NO_VALUE : Generate_Expression (node->binary.right);
+  uint32_t right = right_v.reg;
   uint32_t t = Emit_Temp ();
   const char *op;
   Type_Info *result_type = node->type;
@@ -21335,8 +21359,13 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
         // integers/enums produce i64. Use Expression_Llvm_Type to                                  
         // get the actual type each operand produces.                                              
         //                                                                                          
-        LLVM_Rep left_llvm_type = Expression_LLVM_Rep (node->binary.left);
-        LLVM_Rep right_llvm_type = Expression_LLVM_Rep (node->binary.right);
+        // Each operand's actual emitted rep, not the AST-derived prediction:
+        // the prediction can disagree with what was physically emitted, making
+        // the convert-to-common-type a no-op and emitting an icmp whose operand
+        // width mislabels the register. Both operands are always generated on
+        // the comparison path (membership/range dispatch elsewhere).
+        LLVM_Rep left_llvm_type  = left_v.rep;
+        LLVM_Rep right_llvm_type = right_v.rep;
 
         // Boolean sub-expressions may produce i1 (raw comparisons) or                              
         // i64 (widened booleans). Use actual expression type to avoid                             
@@ -21727,8 +21756,8 @@ LLVM_Value Emit_Binary_Op_Predefined (Syntax_Node *node) {
             else        { t = always; }
             return Emit_Bool_Value ((LLVM_I1){ t });
           }
-          if (range_type and (range_type->low_bound.kind == BOUND_INTEGER or range_type->low_bound.kind == BOUND_EXPR) and
-                (range_type->high_bound.kind == BOUND_INTEGER or range_type->high_bound.kind == BOUND_EXPR)) {
+          if (range_type and Type_Bound_Is_Set (range_type->low_bound)
+                and Type_Bound_Is_Set (range_type->high_bound)) {
             LLVM_Rep lo_bt = LL_REP_VOID, hi_bt = LL_REP_VOID;
             uint32_t bound_low  = Emit_Bound_Value_Typed (&range_type->low_bound, &lo_bt);
             uint32_t bound_high = Emit_Bound_Value_Typed (&range_type->high_bound, &hi_bt);
@@ -22219,6 +22248,11 @@ LLVM_Value Generate_Apply (Syntax_Node *node) {
         uint32_t result = Emit_Temp ();
         Emit ("  %%t%u = sub %s 0, %%t%u\n", result, LLVM_Rep_To_String (t0), v0);
         return Val_Rep (result, t0);
+      }
+      // Unary "+" is identity (RM 4.5.4): yield the operand unchanged rather
+      // than calling a never-emitted predefined-operator body.
+      if (Slice_Equal_Ignore_Case (op_name, S("+"))) {
+        return Val_Rep (v0, t0);
       }
     }
 
@@ -23746,6 +23780,11 @@ type_conversion:
       }
       LLVM_Value result_v = Generate_Expression (arg);
       uint32_t result = result_v.reg;
+      // Actual emitted rep of `result`, tracked so the scalar return below can
+      // reconcile it to the destination even on the same-type pass-through,
+      // where the resolver narrowed the operand's node type to the conversion
+      // target but the value was still emitted at the wider base-type width.
+      LLVM_Rep result_rep = result_v.rep;
 
       // Special handling for fixed-point conversions (RM 4.6)
       // Fixed-point uses scaled integer representation: value = integer * SMALL
@@ -23859,25 +23898,36 @@ type_conversion:
 
         // Types differ - need to convert.
         // Use signedness-aware conversion: zext for unsigned src/dst.
-        LLVM_Rep src_llvm = Expression_LLVM_Rep (arg);
-        // The generated value's real type wins over the Ada-type prediction
-        // when it is fat but the prediction says thin: an unconstrained-array
-        // value flowing in must be treated as {ptr,ptr}, else the converter
-        // null-checks a fat aggregate as a pointer. Narrow to the fat mismatch
-        // to avoid over-trusting .type generally.
-        if (LLVM_Rep_Is_Fat_Pointer (result_v.rep) &&
-            !LLVM_Rep_Is_Fat_Pointer (src_llvm))
-          src_llvm = result_v.rep;
+        // The generated value's actual emitted rep is authoritative; the
+        // AST-derived prediction (Expression_LLVM_Rep) can disagree - e.g. a
+        // subtraction emitted at i32 whose node type the resolver narrowed to
+        // the conversion's target type, or an unconstrained-array value that
+        // is fat when the prediction says thin. Converting from anything but
+        // the value's real rep emits a cast that mislabels the operand.
+        LLVM_Rep src_llvm = result_v.rep;
         LLVM_Rep dst_llvm = Type_To_Rep (dst_type);
         bool conv_unsigned = Type_Is_Unsigned (src_type) or Type_Is_Unsigned (dst_type);
         if (!LLVM_Rep_Equal (src_llvm, dst_llvm)) {
           result = Emit_Convert_Ext (result, src_llvm, dst_llvm, conv_unsigned).reg;
+          result_rep = dst_llvm;
         }
 
         // RM 4.6: Check converted value against target subtype constraint
         if (Type_Is_Scalar (dst_type)) {
           Emit_Constraint_Check_Val ((LLVM_Value){ result, dst_llvm }, dst_type, src_type);
         }
+      }
+
+      // Reconcile to the destination rep. Covers the same-type pass-through:
+      // the value's real rep can be wider than dst's (base-type arithmetic on
+      // a narrow derived/subtype operand), and returning it mislabeled emits a
+      // store/use at the wrong width.
+      {
+        LLVM_Rep dst_rep = Type_To_Rep (dst_type);
+        if (Type_Is_Scalar (dst_type) and not LLVM_Rep_Equal (result_rep, dst_rep)
+            and (LLVM_Rep_Is_Int (result_rep) or LLVM_Rep_Is_Float (result_rep))
+            and (LLVM_Rep_Is_Int (dst_rep) or LLVM_Rep_Is_Float (dst_rep)))
+          result = Emit_Convert (result, result_rep, dst_rep).reg;
       }
       return Val_Of_Type (result, dst_type);
     }
@@ -24550,7 +24600,10 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
       if (needs_runtime_bounds) {
         LLVM_Rep len_bt = Array_Bound_LLVM_Rep (prefix_type);
         uint32_t fat;
-        if (prefix_sym) {
+        // A parameterless-function prefix (e.g. V'LENGTH where V is a function
+        // returning an array) must be called, not loaded as a variable.
+        if (prefix_sym and prefix_sym->kind != SYMBOL_FUNCTION
+            and prefix_sym->kind != SYMBOL_PROCEDURE) {
           fat = Emit_Load_Fat_Pointer (prefix_sym, len_bt).reg;
 
         // Complex prefix expression - generate it to get fat pointer value
@@ -24608,7 +24661,9 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
       if (needs_runtime_bounds) {
         LLVM_Rep rng_bt = Array_Bound_LLVM_Rep (prefix_type);
         uint32_t fat;
-        if (prefix_sym) {
+        // A parameterless-function prefix must be called, not loaded.
+        if (prefix_sym and prefix_sym->kind != SYMBOL_FUNCTION
+            and prefix_sym->kind != SYMBOL_PROCEDURE) {
           fat = Emit_Load_Fat_Pointer (prefix_sym, rng_bt).reg;
 
         // Complex prefix expression - generate it to get fat pointer value
@@ -25105,11 +25160,20 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
         // Convert to prefix type width if different
         LLVM_Rep val_result_t = Type_To_Rep (prefix_type);
         t = Emit_Convert (t, val_iat, val_result_t).reg;
+        return Val_Rep (t, val_result_t);
 
       // Float'VALUE - parse string as float
       } else if (Type_Is_Float_Representation (classify_type)) {
         Emit ("  %%t%u = call double @__ada_float_value(" FAT_PTR_TYPE " %%t%u)\n",
            t, str_val);
+        // __ada_float_value yields double; narrow to the prefix's float rep
+        // (e.g. single-precision FLOAT) and tag honestly.
+        LLVM_Rep float_result_t = Type_To_Rep (prefix_type);
+        if (LLVM_Rep_Is_Float (float_result_t) and
+            not LLVM_Rep_Equal (float_result_t, LLVM_Rep_Float (64)))
+          t = Emit_Convert (t, LLVM_Rep_Float (64), float_result_t).reg;
+        return Val_Rep (t, LLVM_Rep_Is_Float (float_result_t)
+                           ? float_result_t : LLVM_Rep_Float (64));
 
       // Character'VALUE - parse "'x'" format, strip leading/trailing spaces (RM 3.5.5)
       } else if (Type_Is_Character (classify_type)) {
@@ -25171,6 +25235,9 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
         Emit ("Lcval_fail%u:\n", fail_label);
         Emit_Raise_Constraint_Error ("VALUE no match");
         Emit ("Lcval_end%u:\n", end_label);
+        // CHARACTER'VALUE yields the i8 character code; tag it honestly rather
+        // than the shared i32 fall-through.
+        return Val_Rep (t, Type_To_Rep (classify_type));
 
       // Boolean'VALUE - match "TRUE"/"FALSE" case-insensitively, strip spaces (RM 3.5.5)
       } else if (Type_Is_Boolean (classify_type)) {
@@ -25247,6 +25314,9 @@ LLVM_Value Generate_Attribute (Syntax_Node *node) {
         LLVM_Rep bool_result_t = Type_To_Rep (classify_type);
         if (LLVM_Rep_Is_Int (bool_result_t))
           t = Emit_Convert (t, val_iat, bool_result_t).reg;
+        // Return at the value's real width, not the shared i32 fall-through:
+        // BOOLEAN'VALUE stores at i8, so tagging i32 mislabels the register.
+        return Val_Rep (t, LLVM_Rep_Is_Int (bool_result_t) ? bool_result_t : val_iat);
 
       // Enumeration'VALUE - find literal by name and return position
       } else if (Type_Is_Enumeration (classify_type)) {
@@ -27420,9 +27490,9 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
           // Single-index named association: INDEX => expr.
           // Evaluate the index, compute offset, store once.
           } else {
-            uint32_t idx_val = Generate_Expression (choice).reg;
+            LLVM_Value idx_v = Generate_Expression (choice);
             LLVM_Rep agg_idx_type = Integer_Arith_Rep ();
-            idx_val = Emit_Convert (idx_val, Integer_Arith_Rep (), agg_idx_type).reg;
+            uint32_t idx_val = Emit_Convert (idx_v.reg, idx_v.rep, agg_idx_type).reg;
 
             // Update overall aggregate bounds for single-index
             if (track_named_bounds) {
@@ -29004,8 +29074,8 @@ uint32_t Generate_Aggregate (Syntax_Node *node) {
               Emit ("  %%t%u = add %s 0, %lld\n", bval, LLVM_Rep_To_String (bt),
                  (long long)bound->int_value);
             } else if (bound->kind == BOUND_EXPR and bound->expr) {
-              bval = Generate_Expression (bound->expr).reg;
-              bval = Emit_Convert (bval, Integer_Arith_Rep (), bt).reg;
+              LLVM_Value bv = Generate_Expression (bound->expr);
+              bval = Emit_Convert (bv.reg, bv.rep, bt).reg;
             }
             if (bx == 0) lo_val = bval; else hi_val = bval;
           }
@@ -30476,6 +30546,49 @@ void Generate_Assignment (Syntax_Node *node) {
                    Type_Is_Unconstrained_Array (prefix_type);
       Syntax_Node *arg = target->apply.arguments.items[0];
 
+      // ARR (A'RANGE) := source is a slice (RM 4.1.2), not an element. Normalise
+      // the 'RANGE attribute into a synthetic low..high range (A'FIRST .. A'LAST)
+      // so the slice path below handles it; otherwise it falls through to the
+      // element path and stores an aggregate RHS as a scalar (a NO_VALUE reg).
+      if (arg->kind == NK_ATTRIBUTE and
+          Slice_Equal_Ignore_Case (arg->attribute.name, S("RANGE"))) {
+        Syntax_Node *first = Node_New (NK_ATTRIBUTE, arg->location);
+        *first = *arg;
+        first->attribute.name = S("FIRST");
+        Syntax_Node *last = Node_New (NK_ATTRIBUTE, arg->location);
+        *last = *arg;
+        last->attribute.name = S("LAST");
+        Syntax_Node *synth = Node_New (NK_RANGE, arg->location);
+        synth->range.low  = first;
+        synth->range.high = last;
+        synth->type = arg->type;
+        arg = synth;
+      }
+
+      // A positional aggregate assigned to a slice slides to the slice (RM
+      // 5.2.1); its applicable bounds are its own element count, not the whole
+      // array type's. Without this, the aggregate carries the slice target's
+      // full-array type and the positional count-vs-constraint check (e.g. 5
+      // elements vs ARR(1..10)) raises CONSTRAINT_ERROR spuriously.
+      Syntax_Node *slice_src = node->assignment.value;
+      if (arg->kind == NK_RANGE and slice_src and slice_src->kind == NK_AGGREGATE
+          and not slice_src->aggregate.is_named and slice_src->type
+          and Type_Is_Array_Like (slice_src->type)
+          and slice_src->type->array.is_constrained
+          and slice_src->type->array.index_count == 1) {
+        int128_t cnt = (int128_t) slice_src->aggregate.items.count;
+        Type_Info *base = slice_src->type;
+        Type_Info *sub = Arena_Allocate (sizeof (Type_Info));
+        *sub = *base;
+        sub->array.indices = Arena_Allocate (sizeof (Index_Info));
+        sub->array.indices[0] = base->array.indices[0];
+        sub->array.indices[0].low_bound  = (Type_Bound){ .kind = BOUND_INTEGER, .int_value = 1 };
+        sub->array.indices[0].high_bound = (Type_Bound){ .kind = BOUND_INTEGER, .int_value = cnt };
+        if (base->array.element_type and base->array.element_type->size > 0)
+          sub->size = (uint32_t) cnt * base->array.element_type->size;
+        slice_src->type = sub;
+      }
+
       // Check for slice assignment: ARR (low .. high) := source
       // Array slice assignment using memcpy
       if (arg->kind == NK_RANGE) {
@@ -30568,11 +30681,19 @@ void Generate_Assignment (Syntax_Node *node) {
         uint32_t length = Emit_Temp ();
         Emit ("  %%t%u = sub %s %%t%u, %%t%u\n", length, LLVM_Rep_To_String (csa_t), dest_hi_raw, dest_lo_raw);
 
-        // Destination pointer: adjust low bound to array-relative index
+        // Destination pointer: adjust low bound to array-relative index, then
+        // scale to bytes (the GEP is byte-addressed, so an element index must
+        // be multiplied by the element size - otherwise a non-zero slice start
+        // on a wider-than-byte element lands at the wrong offset).
         uint32_t dest_idx = dest_lo_raw;
         if (low_bound != 0) {
           dest_idx = Emit_Temp ();
           Emit ("  %%t%u = sub %s %%t%u, %s\n", dest_idx, LLVM_Rep_To_String (csa_t), dest_lo_raw, I128_Decimal (low_bound));
+        }
+        if (elem_sz != 1) {
+          uint32_t scaled = Emit_Temp ();
+          Emit ("  %%t%u = mul %s %%t%u, %u\n", scaled, LLVM_Rep_To_String (csa_t), dest_idx, elem_sz);
+          dest_idx = scaled;
         }
         uint32_t dest_ptr = Emit_Temp ();
         Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n",
@@ -30641,6 +30762,12 @@ void Generate_Assignment (Syntax_Node *node) {
                  adj, LLVM_Rep_To_String (csa_t), src_start, I128_Decimal (src_low_bound));
               src_start = adj;
             }
+            // Scale the element index to bytes for the byte-addressed GEP.
+            if (elem_sz != 1) {
+              uint32_t scaled = Emit_Temp ();
+              Emit ("  %%t%u = mul %s %%t%u, %u\n", scaled, LLVM_Rep_To_String (csa_t), src_start, elem_sz);
+              src_start = scaled;
+            }
             src_ptr = Emit_Temp ();
             Emit ("  %%t%u = getelementptr i8, ptr %%t%u, %s %%t%u\n",
                src_ptr, src_base, LLVM_Rep_To_String (csa_t), src_start);
@@ -30669,8 +30796,13 @@ void Generate_Assignment (Syntax_Node *node) {
             Emit_Symbol_Storage (src->symbol);
             Emit (", %s 0\n", LLVM_Rep_To_String (csa_t));
 
-          // Expression producing a value (aggregate, call, etc.) -
-          // spill to alloca, then use the alloca as source ptr
+          // Array aggregate / array-returning call already yields a pointer to
+          // the element storage; use it directly as the copy source. (Spilling
+          // it would memcpy the pointer bits, not the array data.)
+          } else if (LLVM_Rep_Is_Pointer (src_llvm)) {
+            src_ptr = src_val;
+
+          // Scalar value fallback - spill to alloca and copy from it.
           } else {
             uint32_t spill = Emit_Temp ();
             Emit ("  %%t%u = alloca %s\n", spill, LLVM_Rep_To_String (src_llvm));
@@ -31441,8 +31573,11 @@ void Generate_Return_Statement (Syntax_Node *node) {
       Emit ("  %%t%u = fptosi %s %%t%u to %s\n", conv_t, LLVM_Rep_To_String (src_fty_rep), div_t, LLVM_Rep_To_String (ret_rep));
       value = Val_Rep (conv_t, ret_rep);
     } else {
-      LLVM_Rep expr_type = Expression_LLVM_Rep (expr);
-      value = Emit_Convert (value.reg, expr_type, ret_rep);
+      // Convert from the value's own emitted rep, not a re-derivation of the
+      // expression's rep from the AST: the two can disagree (e.g. a user-defined
+      // "=" call emits i8 but the AST re-derivation yields i32), and value.reg
+      // was physically emitted with actual_rep.
+      value = Emit_Convert (value.reg, actual_rep, ret_rep);
     }
 
     // RM 6.5: Check return value.reg against function return subtype constraint
